@@ -1,54 +1,49 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use ed25519_dalek::VerifyingKey;
 use std::net::SocketAddr;
+use anyhow::{Result, anyhow};
 
-// ---------------------------------------------------------
-// 节点信息 (PeerInfo)
-// ---------------------------------------------------------
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PeerInfo {
-    pub id: String,
-    pub addr: SocketAddr,
-    pub encryption_pk: [u8; 32],
+    pub node_id: VerifyingKey, // Identity (Ed25519 Public Key)
+    pub addr: SocketAddr,      // Physical Address (IP:Port)
 }
 
-// ---------------------------------------------------------
-// 通讯录管理器 (PeerManager)
-// ---------------------------------------------------------
 #[derive(Clone)]
 pub struct PeerManager {
-    table: Arc<Mutex<HashMap<String, PeerInfo>>>,
+    // 这里的 Key 使用 bytes 是因为 VerifyingKey 不直接支持作为 HashMap Key
+    peers: Arc<Mutex<HashMap<[u8; 32], PeerInfo>>>,
 }
 
 impl PeerManager {
     pub fn new() -> Self {
         Self {
-            table: Arc::new(Mutex::new(HashMap::new())),
+            peers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn add_peer(&self, id: String, addr: SocketAddr, enc_pk: [u8; 32]) {
-        let mut table = self.table.lock().unwrap();
-        let peer = PeerInfo {
-            id: id.clone(),
-            addr,
-            encryption_pk: enc_pk,
-        };
-        println!(">> [通讯录] 已更新节点: {} -> {}", &id[0..8], addr);
-        table.insert(id, peer);
+    pub fn add_peer(&self, node_id: VerifyingKey, addr: SocketAddr) {
+        let mut peers = self.peers.lock().unwrap();
+        peers.insert(node_id.to_bytes(), PeerInfo { node_id, addr });
     }
 
-    pub fn get_peer(&self, id: &str) -> Option<PeerInfo> {
-        let table = self.table.lock().unwrap();
-        table.get(id).cloned()
+    /// 通过 Hex 字符串和 IP 字符串手动注册一个 Peer
+    /// 用于 CLI 模式下 Client 手动指定 Server
+    pub fn add_peer_from_hex(&self, node_id_hex: &str, addr_str: &str) -> Result<()> {
+        let bytes = hex::decode(node_id_hex).map_err(|_| anyhow!("Invalid hex ID"))?;
+        let bytes_array: [u8; 32] = bytes.try_into().map_err(|_| anyhow!("Invalid ID length (must be 32 bytes)"))?;
+        let node_id = VerifyingKey::from_bytes(&bytes_array).map_err(|_| anyhow!("Invalid Key bytes"))?;
+        
+        let addr: SocketAddr = addr_str.parse().map_err(|_| anyhow!("Invalid IP address"))?;
+        
+        self.add_peer(node_id, addr);
+        // println!("[PeerManager] Manually added peer: {} @ {}", node_id_hex, addr);
+        Ok(())
     }
 
-    pub fn list_peers(&self) {
-        let table = self.table.lock().unwrap();
-        println!("--- 当前在线节点表 ({}) ---", table.len());
-        for (id, info) in table.iter() {
-            println!("ID: {}... | IP: {} | CryptoKey: OK", &id[0..8], info.addr);
-        }
-        println!("---------------------------");
+    pub fn get_peer(&self, node_id_bytes: &[u8; 32]) -> Option<PeerInfo> {
+        let peers = self.peers.lock().unwrap();
+        peers.get(node_id_bytes).cloned()
     }
 }

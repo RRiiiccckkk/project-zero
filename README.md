@@ -1,5 +1,6 @@
 ```markdown
-# 🌌 Project Zero: The Genesis of WWW-2.0
+#
+第一版： 🌌 Project Zero: The Genesis of WWW-2.0
 "Build the internet you want to see."
 
 一个基于 Rust 从零构建的、去中心化的、无脚本执行的、端到端加密的下一代互联网原型。
@@ -117,3 +118,39 @@ Project Zero 不仅仅是一堆代码，它是一种抵抗脆弱性的尝试。
 
 Project Zero / Initiated 2025
 ```
+
+第二版：
+# Project Zero: Web 3.0 (WWW-2.0) Prototype
+
+> **Status:** Phase 4 Completed (Discovery & Bootnode Implemented)  
+> **Language:** Rust (Edition 2021)  
+> **License:** MIT / Apache-2.0
+
+## 1. 项目简介 (Introduction)
+Project Zero 是一个实验性的 **Web 3.0 原型网络**，旨在替代脆弱的现代 Web 基础设施。
+它的核心哲学是：
+*   **Identity-based:** 身份即地址 (Ed25519 Public Key)，无需 DNS 和 CA。
+*   **No-Scripting:** 只有纯数据结构 (`SafeDoc`)，没有 JavaScript，杜绝 XSS。
+*   **End-to-End Encrypted:** 基于 X25519 + ChaCha20Poly1305 的默认加密。
+*   **Decentralized:** P2P 架构，支持自动发现。
+
+## 2. 技术架构 (Architecture)
+
+### 核心模块
+*   **`identity`**: 基于 `ed25519-dalek` 生成自权身份。
+*   **`protocol`**: 定义了 `ZeroPacket` (签名负载) 和 `SecureEnvelope` (加密信封)。支持 `Request`, `Response`, `Signal` 三种消息类型。
+*   **`transport`**: 基于 `tokio::UdpSocket` 的异步传输层，实现了 **Stop-and-Wait ARQ** 可靠性重传机制。
+*   **`discovery`**: 基于 Bootnode 的节点发现机制 (Signal Protocol: `Hello` / `Query` / `Found`)。
+*   **`safedoc`**: 替代 HTML 的结构化文档标准，内置 TUI 渲染引擎。
+
+### 网络拓扑
+*   **Unified Node:** 每个节点既是 Server (提供内容) 也是 Client (浏览器)。
+*   **Bootnode:** 轻量级目录服务器，用于协助节点通过 ID 查找 IP。
+
+## 3. 快速开始 (Quick Start)
+
+### 1. 启动种子节点 (Bootnode)
+作为网络的“电话簿”，需最先启动。
+```bash
+cargo run -- bootnode
+# 监听在 127.0.0.1:9999

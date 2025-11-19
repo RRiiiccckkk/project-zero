@@ -1,52 +1,17 @@
 [package]
-name = "project_zero"
-version = "0.1.0"
+name = "project-zero"
+version = "0.2.0"
 edition = "2021"
-authors = ["Architect & Executor"]
 
 [dependencies]
-# ---------------------------------------------------------
-# 1. 核心引擎 (The Engine)
-# ---------------------------------------------------------
-# Tokio 是目前 Rust 最成熟的异步运行时。
-# 我们需要它的 "full" 特性来处理 UDP 网络 IO、定时器和多线程调度。
-tokio = { version = "1", features = ["full"] }
-
-# ---------------------------------------------------------
-# 2. 数据通用语 (The Language)
-# ---------------------------------------------------------
-# Serde 是 Rust 的序列化标准。
-# 我们用它把内存里的结构体转换成可以通过网络发送的二进制或 JSON。
+tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"  # MVP 阶段我们先用 JSON，方便肉眼调试，后期切二进制
-bincode = "1.3"     # 备用：高效的二进制序列化格式
-
-# ---------------------------------------------------------
-# 3. 核心加密套件 (The Shield)
-# ---------------------------------------------------------
-# 我们坚持使用 "Dalek" 系列库，它们是纯 Rust 编写的高性能椭圆曲线实现。
-
-# [身份验证] Ed25519：用于生成公钥/私钥，以及数字签名。
-# 这决定了“你是谁”，且无法伪造。
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-# [新增] X25519：专门用于 Diffie-Hellman 密钥交换
-x25519-dalek = { version = "2", features = ["static_secrets", "reusable_secrets"] }
-
-# [随机数] 生成密钥必须需要高质量的随机源。
-rand = "0.8"
-
-# [加密传输] ChaCha20-Poly1305：现代流加密算法。
-# 比 AES 更适合在这个场景，因为它在没有硬件加速的 CPU 上也跑得很快，且很难写出侧信道漏洞。
+serde_json = "1.0"
+# 注意：必须开启 serde 特性
+ed25519-dalek = { version = "2.0", features = ["rand_core", "serde"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets", "serde"] }
 chacha20poly1305 = "0.10"
-
-# [工具] 用于把二进制密钥转成人类可读的十六进制字符串 (如 "a1b2...")
-hex = "0.4"
-
-# ---------------------------------------------------------
-# 4. 错误处理与日志 (The Black Box)
-# ---------------------------------------------------------
-# 让我们能优雅地处理报错，而不是满屏 panic
+rand = "0.8"
 anyhow = "1.0"
-# 结构化日志系统，方便我们看清网络包是怎么流动的
-tracing = "0.1"
-tracing-subscriber = "0.3"
+clap = { version = "4.0", features = ["derive"] }
+hex = "0.4"

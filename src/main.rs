@@ -1,188 +1,340 @@
 mod identity;
+mod crypto;
 mod protocol;
 mod transport;
-mod crypto;
 mod peers;
 mod safedoc;
 
-use anyhow::Result;
-use identity::NodeIdentity;
-use protocol::{Message, ZeroPacket, SecureEnvelope};
-use transport::ZeroTransport;
-use crypto::{CryptoBox, Decryptor};
-use safedoc::{SafePage, Element};
-use std::time::Duration;
-use std::net::SocketAddr;
+use clap::{Parser, Subcommand};
+use anyhow::Result; // 移除了未使用的 anyhow 宏引用
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use tokio::time::{timeout, Duration};
+use std::io::{self, Write};
+use tokio::sync::mpsc;
+use std::collections::HashMap;
 
-// ============================================================================
-// 服务器逻辑 (The Server)
-// ============================================================================
-async fn run_server() -> Result<()> {
-    // 1. 初始化
-    let identity = NodeIdentity::load_or_create()?;
-    let decryptor = Decryptor::load_or_create()?;
-    let mut transport = ZeroTransport::bind(8080).await?;
-    
-    println!("✅ [Server] 核心启动 | 身份: {}... | 监听: 8080", &identity.get_id_string()[0..8]);
+use crate::identity::NodeIdentity;
+use crate::transport::TransportLayer;
+use crate::peers::PeerManager;
+use crate::protocol::{SecureEnvelope, ZeroPacket, MessageType, Signal};
+use crate::safedoc::{SafePage, Element};
 
-    loop {
-        // 2. 接收加密信封
-        let (envelope, src_addr) = match transport.recv().await {
-            Ok(res) => res,
-            Err(e) => { eprintln!("   [Server] 接收错误: {}", e); continue; }
-        };
+const DEFAULT_PORT: u16 = 9000;
+const BOOTNODE_ADDR: &str = "127.0.0.1:9999"; // 硬编码的种子节点地址
 
-        // 3. 解密
-        let decrypted = match decryptor.decrypt(&envelope.ephemeral_pk, &envelope.nonce, &envelope.ciphertext) {
-            Ok(d) => d,
-            Err(_) => { println!("   [Server] ⚠️ 拦截到无法解密的恶意包"); continue; }
-        };
-
-        // 4. 验证签名
-        let packet: ZeroPacket = serde_json::from_slice(&decrypted)?;
-        let request_msg = match packet.verify() {
-            Ok(m) => m,
-            Err(_) => { println!("   [Server] ⚠️ 签名无效，丢弃"); continue; }
-        };
-
-        // 5. 处理请求
-        if let Message::Request { path, reply_key } = request_msg {
-            println!("   [Server] 收到请求: {} | 来自: {}", path, src_addr);
-            
-            // --- 生成页面 ---
-            let resp_msg = match path.as_str() {
-                "/home" => {
-                    let page = SafePage::new("Project Zero 首页")
-                        .add(Element::Header("欢迎来到暗网".to_string()))
-                        .add(Element::Text("恭喜！你刚刚完成了一次端到端的绝密通信。".to_string()))
-                        .add(Element::Text("服务器不知道你是谁，ISP看不到你在读什么。".to_string()))
-                        .add(Element::Link { label: "关于我们".to_string(), target_id: identity.get_id_string() });
-                    Message::Response { page }
-                },
-                _ => Message::NotFound { reason: "404: 虚空之中空无一物".to_string() },
-            };
-
-            // 6. 加密回信 (使用 Request 里带来的 reply_key)
-            //    注意：这次 Server 是发送方，Server 生成临时密钥
-            let box_server = CryptoBox::new();
-            
-            //    A. 制作签名包
-            let signed_resp = ZeroPacket::new(&identity, resp_msg)?;
-            let signed_bytes = serde_json::to_vec(&signed_resp)?;
-            
-            //    B. 加密
-            let server_ephemeral_pk = box_server.get_public_key_bytes();
-            let (nonce, ciphertext) = box_server.encrypt(&reply_key, &signed_bytes)?; // 这里消耗了 box_server
-            
-            //    C. 封装
-            let resp_envelope = SecureEnvelope {
-                ephemeral_pk: server_ephemeral_pk,
-                nonce,
-                ciphertext,
-            };
-
-            //    D. 发送 (复用 transport)
-            transport.send(&resp_envelope, src_addr).await?;
-            println!("   [Server] 响应已加密并发送 -> {}", src_addr);
-        }
-    }
+#[derive(Parser)]
+#[command(name = "Project Zero")]
+#[command(version = "0.5.1")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-// ============================================================================
-// 客户端逻辑 (The Client)
-// ============================================================================
-async fn run_client() -> Result<()> {
-    // 给 Server 一点启动时间
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // 1. 初始化
-    let identity = NodeIdentity::load_or_create()?;
-    let decryptor = Decryptor::load_or_create()?; // Client 也有长期加密私钥
-    let transport = ZeroTransport::bind(0).await?; // 随机端口
-    
-    // 假设我们要访问的目标 (Server)
-    // 在真实网络中，这里应该是从 PeerManager 查出来的
-    // 这里我们硬编码 Server 的加密公钥 (模拟已知)
-    // *** 注意：实际运行中，因为是在同一台机跑，Server的key也是这一份 ***
-    // 为了简单，我们直接重新加载一次 Decryptor 拿到 Key，或者你可以把 Server 的 key 打印出来填这里
-    let server_target_addr: SocketAddr = "127.0.0.1:8080".parse()?;
-    let server_enc_pk = decryptor.get_public_key_bytes(); // 这里偷懒了，假设 Client 知道 Server 的 Key
-
-    println!("\n>> [Client] 浏览器启动。正在连接暗网...");
-
-    // 2. 构造请求
-    // 这里的关键是：把 decryptor.get_public_key_bytes() 塞进去，告诉 Server 怎么回信
-    let req_msg = Message::Request { 
-        path: "/home".to_string(),
-        reply_key: decryptor.get_public_key_bytes() 
-    };
-    
-    let signed_req = ZeroPacket::new(&identity, req_msg)?;
-    let signed_bytes = serde_json::to_vec(&signed_req)?;
-
-    // 3. 加密发送
-    let box_client = CryptoBox::new();
-    let client_ephemeral_pk = box_client.get_public_key_bytes();
-    let (nonce, ciphertext) = box_client.encrypt(&server_enc_pk, &signed_bytes)?;
-
-    let req_envelope = SecureEnvelope {
-        ephemeral_pk: client_ephemeral_pk,
-        nonce,
-        ciphertext,
-    };
-
-    transport.send(&req_envelope, server_target_addr).await?;
-    println!(">> [Client] 请求已发送，等待回信...");
-
-    // 4. 接收响应 (这里用 transport.socket 因为我们要 split 出来用，或者简单点直接创建一个新的 loop)
-    // 由于 ZeroTransport 的 recv 需要 &mut self，我们在单次发送后直接调用即可
-    // 注意：我们要把 transport 变为可变
-    let mut transport = transport; 
-    
-    // 等待回信 (5秒超时)
-    let timeout = tokio::time::timeout(Duration::from_secs(5), transport.recv());
-    
-    match timeout.await {
-        Ok(Ok((resp_envelope, _))) => {
-            println!(">> [Client] 收到加密数据，正在渲染...");
-            
-            // 5. 解密响应
-            let decrypted = decryptor.decrypt(&resp_envelope.ephemeral_pk, &resp_envelope.nonce, &resp_envelope.ciphertext)?;
-            
-            // 6. 验证签名
-            let packet: ZeroPacket = serde_json::from_slice(&decrypted)?;
-            let msg = packet.verify()?;
-            
-            // 7. 渲染页面
-            if let Message::Response { page } = msg {
-                // *** 调用渲染引擎 ***
-                page.render();
-            } else {
-                println!(">> [Client] 错误：收到的不是页面");
-            }
-        },
-        _ => println!(">> [Client] 请求超时，服务器可能已下线。"),
-    }
-
-    Ok(())
+#[derive(Subcommand)]
+enum Commands {
+    GenId,
+    /// 启动种子节点 (Directory Server)
+    Bootnode,
+    /// 启动普通节点 (P2P Client/Server)
+    Start {
+        #[arg(short, long, default_value_t = DEFAULT_PORT)]
+        port: u16,
+    },
 }
 
-// ============================================================================
-// 主入口
-// ============================================================================
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 启动 Server 任务
-    tokio::spawn(async {
-        if let Err(e) = run_server().await {
-            eprintln!("Server Error: {}", e);
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::GenId => {
+            println!("{}", hex::encode(NodeIdentity::new().get_public_key().to_bytes()));
         }
-    });
+        Commands::Bootnode => {
+            run_bootnode().await?;
+        }
+        Commands::Start { port } => {
+            run_node(port).await?;
+        }
+    }
+    Ok(())
+}
 
-    // 启动 Client 任务
-    if let Err(e) = run_client().await {
-        eprintln!("Client Error: {}", e);
+// ==========================================
+// 1. Bootnode 逻辑 (The Phonebook)
+// ==========================================
+async fn run_bootnode() -> Result<()> {
+    let identity = Arc::new(NodeIdentity::new());
+    let socket = UdpSocket::bind(BOOTNODE_ADDR).await?;
+    let transport = Arc::new(TransportLayer::new(socket));
+    
+    // 内存数据库：ID (Hex) -> IP:Port (String)
+    let mut registry: HashMap<String, String> = HashMap::new();
+
+    println!("=== Zero Bootnode Running ===");
+    println!("ID      : {}", hex::encode(identity.get_public_key().to_bytes()));
+    println!("Address : {}", BOOTNODE_ADDR);
+    println!("Waiting for nodes...");
+
+    let mut buf = [0u8; 65535];
+
+    loop {
+        if let Ok((size, src_addr)) = transport.socket.recv_from(&mut buf).await {
+            let data = &buf[..size];
+            if data.len() <= 32 { continue; }
+
+            let sender_id_bytes = &data[0..32];
+            let envelope_bytes = &data[32..];
+
+            if let Ok(sender_id) = ed25519_dalek::VerifyingKey::from_bytes(sender_id_bytes.try_into().unwrap()) {
+                let sender_hex = hex::encode(sender_id.to_bytes());
+
+                if let Ok(env) = serde_json::from_slice::<SecureEnvelope>(envelope_bytes) {
+                    if let Ok(decrypted) = env.open(&identity, &sender_id) {
+                        if let Ok(packet) = serde_json::from_slice::<ZeroPacket>(&decrypted) {
+                            if packet.verify(&sender_id) {
+                                match packet.msg_type {
+                                    MessageType::Signal => {
+                                        if let Ok(signal) = serde_json::from_slice::<Signal>(&packet.payload) {
+                                            match signal {
+                                                Signal::Hello => {
+                                                    // 注册节点
+                                                    registry.insert(sender_hex.clone(), src_addr.to_string());
+                                                    println!("[Bootnode] Registered: {} -> {}", &sender_hex[0..8], src_addr);
+                                                },
+                                                Signal::Query(target_id_hex) => {
+                                                    // 查询节点
+                                                    println!("[Bootnode] Lookup query for: {}", &target_id_hex[0..8]);
+                                                    if let Some(addr) = registry.get(&target_id_hex) {
+                                                        // 找到目标，发送 Found
+                                                        let response = Signal::Found {
+                                                            id: target_id_hex.clone(),
+                                                            addr: addr.clone()
+                                                        };
+                                                        let payload = serde_json::to_vec(&response)?;
+                                                        // 封包发回
+                                                        let pkt = ZeroPacket::new(&identity, payload, MessageType::Signal)?;
+                                                        let env = SecureEnvelope::seal(&identity, &sender_id, &serde_json::to_vec(&pkt)?)?;
+                                                        
+                                                        let mut final_data = Vec::new();
+                                                        final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
+                                                        final_data.extend_from_slice(&serde_json::to_vec(&env)?);
+                                                        transport.socket.send_to(&final_data, src_addr).await?;
+                                                    }
+                                                },
+                                                _ => {}
+                                            }
+                                        }
+                                    },
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==========================================
+// 2. Regular Node 逻辑 (Auto Discovery)
+// ==========================================
+async fn run_node(port: u16) -> Result<()> {
+    let identity = Arc::new(NodeIdentity::new());
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port)).await?;
+    let transport = Arc::new(TransportLayer::new(socket));
+    let peer_manager = Arc::new(PeerManager::new());
+
+    println!("=== Zero P2P Node Started ===");
+    println!("My ID   : {}", hex::encode(identity.get_public_key().to_bytes()));
+    println!("Address : 127.0.0.1:{}", port);
+
+    // === Auto Register: Tell Bootnode we are here ===
+    let bootnode_addr = BOOTNODE_ADDR.to_string();
+    // 先尝试把 Bootnode 加到本地（不一定要成功，如果地址不对会报错，但不影响逻辑）
+    let _ = peer_manager.add_peer_from_hex(&hex::encode(identity.get_public_key().to_bytes()), &bootnode_addr);
+
+    {
+        let signal = Signal::Hello;
+        let payload = serde_json::to_vec(&signal)?;
+        let pkt = ZeroPacket::new(&identity, payload, MessageType::Signal)?;
+        
+        // === 修复点：直接使用 &VerifyingKey ===
+        let my_pk = identity.get_public_key();
+        let env = SecureEnvelope::seal(&identity, &my_pk, &serde_json::to_vec(&pkt)?)?; 
+        
+        let mut final_data = Vec::new();
+        final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
+        final_data.extend_from_slice(&serde_json::to_vec(&env)?);
+        
+        // 即使 Bootnode 没启动，这里 UDP 发送也不会报错，只是丢包
+        let _ = transport.socket.send_to(&final_data, BOOTNODE_ADDR).await;
+        println!("[System] Sent Hello to Bootnode.");
     }
 
+    let (tx_response, mut rx_response) = mpsc::channel::<SafePage>(10);
+    let net_transport = transport.clone();
+    let net_identity = identity.clone();
+    let net_peers = peer_manager.clone();
+    
+    tokio::spawn(async move {
+        network_listener(net_transport, net_identity, net_peers, tx_response).await;
+    });
+
+    loop {
+        print!("zero> ");
+        io::stdout().flush()?;
+
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.is_empty() { continue; }
+
+        match parts[0] {
+            "exit" => break,
+            "get" => {
+                if parts.len() == 3 {
+                    let target_id_hex = parts[1];
+                    let path = parts[2];
+
+                    // 1. 检查本地 PeerManager
+                    let target_peer_opt = if let Ok(bytes) = hex::decode(target_id_hex) {
+                        if let Ok(arr) = bytes.try_into() {
+                            peer_manager.get_peer(&arr)
+                        } else { None }
+                    } else { None };
+
+                    if let Some(peer) = target_peer_opt {
+                        // 2a. 认识这个节点 -> 直接发送请求
+                        println!("[System] Fetching {} from {}...", path, &target_id_hex[0..8]);
+                        send_request(&transport, &identity, &peer, path).await?;
+
+                        match timeout(Duration::from_secs(2), rx_response.recv()).await {
+                            Ok(Some(page)) => page.render(),
+                            Ok(None) => println!("[Error] Channel closed."),
+                            Err(_) => println!("[Error] Request timed out."),
+                        }
+                    } else {
+                        // 2b. 不认识这个节点 -> 向 Bootnode 查询
+                        println!("[Discovery] Peer unknown. Querying Bootnode...");
+                        
+                        let signal = Signal::Query(target_id_hex.to_string());
+                        let payload = serde_json::to_vec(&signal)?;
+                        let pkt = ZeroPacket::new(&identity, payload, MessageType::Signal)?;
+                        
+                        // === 修复点：直接使用 &VerifyingKey ===
+                        let my_pk = identity.get_public_key();
+                        let env = SecureEnvelope::seal(&identity, &my_pk, &serde_json::to_vec(&pkt)?)?;
+                        
+                        let mut final_data = Vec::new();
+                        final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
+                        final_data.extend_from_slice(&serde_json::to_vec(&env)?);
+                        transport.socket.send_to(&final_data, BOOTNODE_ADDR).await?;
+                        
+                        println!("[Discovery] Query sent. If found, try 'get' again in a moment.");
+                    }
+                } else {
+                    println!("Usage: get <NodeID> <Path>");
+                }
+            },
+            _ => println!("Unknown command."),
+        }
+    }
     Ok(())
+}
+
+async fn send_request(transport: &Arc<TransportLayer>, identity: &Arc<NodeIdentity>, peer: &crate::peers::PeerInfo, path: &str) -> Result<()> {
+    let req = format!("GET {}", path);
+    let pkt = ZeroPacket::new(identity, req.into_bytes(), MessageType::Request)?;
+    let env = SecureEnvelope::seal(identity, &peer.node_id, &serde_json::to_vec(&pkt)?)?;
+    let mut final_data = Vec::new();
+    final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
+    final_data.extend_from_slice(&serde_json::to_vec(&env)?);
+    transport.socket.send_to(&final_data, peer.addr).await?;
+    Ok(())
+}
+
+async fn network_listener(
+    transport: Arc<TransportLayer>,
+    identity: Arc<NodeIdentity>,
+    peer_manager: Arc<PeerManager>,
+    tx_response: mpsc::Sender<SafePage>
+) {
+    let mut buf = [0u8; 65535];
+    loop {
+        if let Ok((size, src_addr)) = transport.socket.recv_from(&mut buf).await {
+            let data = &buf[..size];
+            if data.len() <= 32 { continue; }
+
+            let sender_id_bytes = &data[0..32];
+            let envelope_bytes = &data[32..];
+            
+            if let Ok(sender_id) = ed25519_dalek::VerifyingKey::from_bytes(sender_id_bytes.try_into().unwrap()) {
+                // 自动学习 sender IP
+                peer_manager.add_peer(sender_id, src_addr);
+
+                if let Ok(env) = serde_json::from_slice::<SecureEnvelope>(envelope_bytes) {
+                    if let Ok(decrypted) = env.open(&identity, &sender_id) {
+                        if let Ok(packet) = serde_json::from_slice::<ZeroPacket>(&decrypted) {
+                            if packet.verify(&sender_id) {
+                                match packet.msg_type {
+                                    MessageType::Signal => {
+                                        // 处理信令 (Found)
+                                        if let Ok(signal) = serde_json::from_slice::<Signal>(&packet.payload) {
+                                            if let Signal::Found { id, addr } = signal {
+                                                println!("\n[Discovery] SUCCESS! Found {} at {}", &id[0..8], addr);
+                                                println!("zero> "); // 恢复提示符
+                                                io::stdout().flush().unwrap();
+                                                
+                                                // 注册发现的节点到 PeerManager
+                                                let _ = peer_manager.add_peer_from_hex(&id, &addr);
+                                            }
+                                        }
+                                    },
+                                    MessageType::Request => {
+                                        let req_str = String::from_utf8_lossy(&packet.payload);
+                                        let page = generate_page(&req_str, &identity);
+                                        if let Ok(resp_payload) = serde_json::to_vec(&page) {
+                                            if let Ok(resp_pkt) = ZeroPacket::new(&identity, resp_payload, MessageType::Response) {
+                                                if let Ok(resp_env) = SecureEnvelope::seal(&identity, &sender_id, &serde_json::to_vec(&resp_pkt).unwrap()) {
+                                                    let mut final_data = Vec::new();
+                                                    final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
+                                                    final_data.extend_from_slice(&serde_json::to_vec(&resp_env).unwrap());
+                                                    let _ = transport.socket.send_to(&final_data, src_addr).await;
+                                                }
+                                            }
+                                        }
+                                    },
+                                    MessageType::Response => {
+                                        if let Ok(page) = serde_json::from_slice::<SafePage>(&packet.payload) {
+                                            let _ = tx_response.send_timeout(page, Duration::from_millis(100)).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn generate_page(req: &str, identity: &NodeIdentity) -> SafePage {
+    let req = req.trim();
+    match req {
+        "GET /index" | "GET /" => SafePage {
+            title: "Zero Node".to_string(),
+            elements: vec![
+                Element::Header("Welcome to Web 3.0".to_string()),
+                Element::Text(format!("Node: ...{}", &hex::encode(identity.get_public_key().to_bytes())[56..])),
+                Element::Text("Discovery: Bootnode Enabled".to_string()),
+            ],
+        },
+        _ => SafePage {
+            title: "404".to_string(),
+            elements: vec![Element::Text("Not Found".to_string())],
+        }
+    }
 }
