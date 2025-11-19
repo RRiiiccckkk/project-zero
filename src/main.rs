@@ -1,340 +1,284 @@
-mod identity;
-mod crypto;
 mod protocol;
 mod transport;
 mod peers;
 mod safedoc;
 
-use clap::{Parser, Subcommand};
-use anyhow::Result; // 移除了未使用的 anyhow 宏引用
-use std::sync::Arc;
-use tokio::net::UdpSocket;
-use tokio::time::{timeout, Duration};
-use std::io::{self, Write};
+use clap::Parser;
+use std::net::SocketAddr;
 use tokio::sync::mpsc;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use rand::rngs::OsRng;
+use ed25519_dalek::SigningKey;
+use x25519_dalek::StaticSecret;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadCore};
+use chacha20poly1305::aead::Aead;
+use hex;
+use sha2::{Sha256, Digest};
 
-use crate::identity::NodeIdentity;
-use crate::transport::TransportLayer;
-use crate::peers::PeerManager;
-use crate::protocol::{SecureEnvelope, ZeroPacket, MessageType, Signal};
-use crate::safedoc::{SafePage, Element};
-
-const DEFAULT_PORT: u16 = 9000;
-const BOOTNODE_ADDR: &str = "127.0.0.1:9999"; // 硬编码的种子节点地址
+use protocol::{Signal, ZeroPacket, SecureEnvelope, NodeId};
+use transport::UdpTransport;
+use peers::RoutingTable;
+use safedoc::SafePage;
 
 #[derive(Parser)]
-#[command(name = "Project Zero")]
-#[command(version = "0.5.1")]
+#[command(name = "project-zero")]
 struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+    #[arg(short, long, default_value = "0.0.0.0:0")]
+    bind: String,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    GenId,
-    /// 启动种子节点 (Directory Server)
-    Bootnode,
-    /// 启动普通节点 (P2P Client/Server)
-    Start {
-        #[arg(short, long, default_value_t = DEFAULT_PORT)]
-        port: u16,
-    },
+struct KeyStore {
+    sign_key: SigningKey,
+    #[allow(dead_code)]
+    ecdh_secret: StaticSecret,
 }
+
+impl KeyStore {
+    fn new() -> Self {
+        let mut csprng = OsRng;
+        let sign_key = SigningKey::generate(&mut csprng);
+        let ecdh_secret = StaticSecret::random_from_rng(&mut csprng);
+        Self { sign_key, ecdh_secret }
+    }
+    
+    fn node_id(&self) -> NodeId {
+        self.sign_key.verifying_key().to_bytes()
+    }
+}
+
+type Storage = Arc<Mutex<HashMap<[u8; 32], String>>>;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    match cli.command {
-        Commands::GenId => {
-            println!("{}", hex::encode(NodeIdentity::new().get_public_key().to_bytes()));
-        }
-        Commands::Bootnode => {
-            run_bootnode().await?;
-        }
-        Commands::Start { port } => {
-            run_node(port).await?;
-        }
-    }
-    Ok(())
-}
-
-// ==========================================
-// 1. Bootnode 逻辑 (The Phonebook)
-// ==========================================
-async fn run_bootnode() -> Result<()> {
-    let identity = Arc::new(NodeIdentity::new());
-    let socket = UdpSocket::bind(BOOTNODE_ADDR).await?;
-    let transport = Arc::new(TransportLayer::new(socket));
+    let socket_addr: SocketAddr = cli.bind.parse()?;
     
-    // 内存数据库：ID (Hex) -> IP:Port (String)
-    let mut registry: HashMap<String, String> = HashMap::new();
+    let keys = Arc::new(KeyStore::new());
+    let my_id = keys.node_id();
+    println!("Node Started. ID: {}", hex::encode(my_id));
 
-    println!("=== Zero Bootnode Running ===");
-    println!("ID      : {}", hex::encode(identity.get_public_key().to_bytes()));
-    println!("Address : {}", BOOTNODE_ADDR);
-    println!("Waiting for nodes...");
+    let transport: Arc<UdpTransport> = Arc::new(UdpTransport::new(socket_addr).await?);
+    println!("Listening on: {}", transport.local_addr()?);
 
-    let mut buf = [0u8; 65535];
+    let routing_table = Arc::new(Mutex::new(RoutingTable::new(my_id)));
+    let storage: Storage = Arc::new(Mutex::new(HashMap::new()));
 
-    loop {
-        if let Ok((size, src_addr)) = transport.socket.recv_from(&mut buf).await {
-            let data = &buf[..size];
-            if data.len() <= 32 { continue; }
+    let (tx_cmd, mut rx_cmd) = mpsc::channel::<String>(32);
 
-            let sender_id_bytes = &data[0..32];
-            let envelope_bytes = &data[32..];
+    let t_recv = transport.clone();
+    let keys_recv = keys.clone();
+    let rt_recv = routing_table.clone();
+    let store_recv = storage.clone();
 
-            if let Ok(sender_id) = ed25519_dalek::VerifyingKey::from_bytes(sender_id_bytes.try_into().unwrap()) {
-                let sender_hex = hex::encode(sender_id.to_bytes());
+    tokio::spawn(async move {
+        loop {
+            match t_recv.recv().await {
+                Ok((packet, addr)) => {
+                    if let Ok(envelope) = serde_json::from_slice::<SecureEnvelope>(&packet.payload) {
+                        let sender_id = envelope.sender_pubkey;
+                        if let Ok(signal) = decrypt_signal(&keys_recv, &envelope) {
+                            handle_signal(signal, sender_id, addr, &rt_recv, &store_recv, &t_recv, &keys_recv).await;
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Receive error: {}", e),
+            }
+        }
+    });
 
-                if let Ok(env) = serde_json::from_slice::<SecureEnvelope>(envelope_bytes) {
-                    if let Ok(decrypted) = env.open(&identity, &sender_id) {
-                        if let Ok(packet) = serde_json::from_slice::<ZeroPacket>(&decrypted) {
-                            if packet.verify(&sender_id) {
-                                match packet.msg_type {
-                                    MessageType::Signal => {
-                                        if let Ok(signal) = serde_json::from_slice::<Signal>(&packet.payload) {
-                                            match signal {
-                                                Signal::Hello => {
-                                                    // 注册节点
-                                                    registry.insert(sender_hex.clone(), src_addr.to_string());
-                                                    println!("[Bootnode] Registered: {} -> {}", &sender_hex[0..8], src_addr);
-                                                },
-                                                Signal::Query(target_id_hex) => {
-                                                    // 查询节点
-                                                    println!("[Bootnode] Lookup query for: {}", &target_id_hex[0..8]);
-                                                    if let Some(addr) = registry.get(&target_id_hex) {
-                                                        // 找到目标，发送 Found
-                                                        let response = Signal::Found {
-                                                            id: target_id_hex.clone(),
-                                                            addr: addr.clone()
-                                                        };
-                                                        let payload = serde_json::to_vec(&response)?;
-                                                        // 封包发回
-                                                        let pkt = ZeroPacket::new(&identity, payload, MessageType::Signal)?;
-                                                        let env = SecureEnvelope::seal(&identity, &sender_id, &serde_json::to_vec(&pkt)?)?;
-                                                        
-                                                        let mut final_data = Vec::new();
-                                                        final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
-                                                        final_data.extend_from_slice(&serde_json::to_vec(&env)?);
-                                                        transport.socket.send_to(&final_data, src_addr).await?;
-                                                    }
-                                                },
-                                                _ => {}
-                                            }
-                                        }
-                                    },
-                                    _ => {}
-                                }
+    tokio::spawn(async move {
+        let stdin = io::stdin();
+        loop {
+            print!("> ");
+            io::stdout().flush().unwrap();
+            let mut line = String::new();
+            if stdin.read_line(&mut line).is_ok() {
+                let _ = tx_cmd.send(line.trim().to_string()).await;
+            }
+        }
+    });
+
+    while let Some(cmd) = rx_cmd.recv().await {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        if parts.is_empty() { continue; }
+
+        match parts[0] {
+            "id" => println!("My ID: {}", hex::encode(my_id)),
+            "peers" => {
+                let rt = routing_table.lock().unwrap();
+                let peers = rt.list_all();
+                println!("Known Peers: {}", peers.len());
+                for (id, addr) in peers {
+                    println!(" - {} @ {}", hex::encode(id), addr);
+                }
+            },
+            "bootstrap" => {
+                if parts.len() < 2 { println!("Usage: bootstrap <ip:port>"); continue; }
+                if let Ok(addr) = parts[1].parse::<SocketAddr>() {
+                    println!("Bootstrapping via {}", addr);
+                    send_signal(&transport, &keys, addr, Signal::FindNode(keys.node_id())).await;
+                }
+            },
+            // Phase 8: 发布页面
+            "publish" => {
+                // 创建一个示例页面并发布
+                let page = SafePage::example();
+                let json = serde_json::to_string(&page).unwrap();
+                
+                let key = hash_content(&json);
+                println!("Publishing Page...");
+                println!("Page Key: \x1b[32m{}\x1b[0m", hex::encode(key)); // Green Key
+                
+                let closest = { routing_table.lock().unwrap().closest_nodes(&key) };
+                if closest.is_empty() {
+                    storage.lock().unwrap().insert(key, json);
+                    println!("Stored locally.");
+                } else {
+                    for (_, addr) in closest {
+                        send_signal(&transport, &keys, addr, Signal::Store(key, json.clone())).await;
+                    }
+                    println!("Sent to network.");
+                }
+            },
+            // Phase 8: 浏览 (渲染) 页面
+            "browse" => {
+                if parts.len() < 2 { println!("Usage: browse <key_hex>"); continue; }
+                if let Ok(key_bytes) = hex::decode(parts[1]) {
+                    if key_bytes.len() == 32 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&key_bytes);
+                        
+                        // 1. 先查本地
+                        let local_val = { storage.lock().unwrap().get(&key).cloned() };
+                        if let Some(val) = local_val {
+                            render_json(&val);
+                        } else {
+                            // 2. 查网络 (注意：这里简化了逻辑，真实浏览器应该挂起等待结果)
+                            // 这里的 browse 只是发送请求，结果会在 handle_signal 里异步打印。
+                            // 为了演示，我们通过特殊的 Signal::FindValue 触发，但 handle_signal 需要知道如何处理渲染。
+                            // 简化方案：Handle Signal 收到 Value 后，尝试解析为 SafePage，如果成功则渲染。
+                            println!("Fetching page from DHT...");
+                            let closest = { routing_table.lock().unwrap().closest_nodes(&key) };
+                            for (_, addr) in closest {
+                                send_signal(&transport, &keys, addr, Signal::FindValue(key)).await;
                             }
                         }
                     }
                 }
-            }
-        }
-    }
-}
-
-// ==========================================
-// 2. Regular Node 逻辑 (Auto Discovery)
-// ==========================================
-async fn run_node(port: u16) -> Result<()> {
-    let identity = Arc::new(NodeIdentity::new());
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port)).await?;
-    let transport = Arc::new(TransportLayer::new(socket));
-    let peer_manager = Arc::new(PeerManager::new());
-
-    println!("=== Zero P2P Node Started ===");
-    println!("My ID   : {}", hex::encode(identity.get_public_key().to_bytes()));
-    println!("Address : 127.0.0.1:{}", port);
-
-    // === Auto Register: Tell Bootnode we are here ===
-    let bootnode_addr = BOOTNODE_ADDR.to_string();
-    // 先尝试把 Bootnode 加到本地（不一定要成功，如果地址不对会报错，但不影响逻辑）
-    let _ = peer_manager.add_peer_from_hex(&hex::encode(identity.get_public_key().to_bytes()), &bootnode_addr);
-
-    {
-        let signal = Signal::Hello;
-        let payload = serde_json::to_vec(&signal)?;
-        let pkt = ZeroPacket::new(&identity, payload, MessageType::Signal)?;
-        
-        // === 修复点：直接使用 &VerifyingKey ===
-        let my_pk = identity.get_public_key();
-        let env = SecureEnvelope::seal(&identity, &my_pk, &serde_json::to_vec(&pkt)?)?; 
-        
-        let mut final_data = Vec::new();
-        final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
-        final_data.extend_from_slice(&serde_json::to_vec(&env)?);
-        
-        // 即使 Bootnode 没启动，这里 UDP 发送也不会报错，只是丢包
-        let _ = transport.socket.send_to(&final_data, BOOTNODE_ADDR).await;
-        println!("[System] Sent Hello to Bootnode.");
-    }
-
-    let (tx_response, mut rx_response) = mpsc::channel::<SafePage>(10);
-    let net_transport = transport.clone();
-    let net_identity = identity.clone();
-    let net_peers = peer_manager.clone();
-    
-    tokio::spawn(async move {
-        network_listener(net_transport, net_identity, net_peers, tx_response).await;
-    });
-
-    loop {
-        print!("zero> ");
-        io::stdout().flush()?;
-
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
-        if parts.is_empty() { continue; }
-
-        match parts[0] {
-            "exit" => break,
+            },
+            "put" => {
+                 if parts.len() < 2 { println!("Usage: put <content>"); continue; }
+                 let content = parts[1..].join(" ");
+                 let key = hash_content(&content);
+                 println!("Key: {}", hex::encode(key));
+                 let closest = { routing_table.lock().unwrap().closest_nodes(&key) };
+                 for (_, addr) in closest {
+                     send_signal(&transport, &keys, addr, Signal::Store(key, content.clone())).await;
+                 }
+            },
             "get" => {
-                if parts.len() == 3 {
-                    let target_id_hex = parts[1];
-                    let path = parts[2];
-
-                    // 1. 检查本地 PeerManager
-                    let target_peer_opt = if let Ok(bytes) = hex::decode(target_id_hex) {
-                        if let Ok(arr) = bytes.try_into() {
-                            peer_manager.get_peer(&arr)
-                        } else { None }
-                    } else { None };
-
-                    if let Some(peer) = target_peer_opt {
-                        // 2a. 认识这个节点 -> 直接发送请求
-                        println!("[System] Fetching {} from {}...", path, &target_id_hex[0..8]);
-                        send_request(&transport, &identity, &peer, path).await?;
-
-                        match timeout(Duration::from_secs(2), rx_response.recv()).await {
-                            Ok(Some(page)) => page.render(),
-                            Ok(None) => println!("[Error] Channel closed."),
-                            Err(_) => println!("[Error] Request timed out."),
-                        }
-                    } else {
-                        // 2b. 不认识这个节点 -> 向 Bootnode 查询
-                        println!("[Discovery] Peer unknown. Querying Bootnode...");
-                        
-                        let signal = Signal::Query(target_id_hex.to_string());
-                        let payload = serde_json::to_vec(&signal)?;
-                        let pkt = ZeroPacket::new(&identity, payload, MessageType::Signal)?;
-                        
-                        // === 修复点：直接使用 &VerifyingKey ===
-                        let my_pk = identity.get_public_key();
-                        let env = SecureEnvelope::seal(&identity, &my_pk, &serde_json::to_vec(&pkt)?)?;
-                        
-                        let mut final_data = Vec::new();
-                        final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
-                        final_data.extend_from_slice(&serde_json::to_vec(&env)?);
-                        transport.socket.send_to(&final_data, BOOTNODE_ADDR).await?;
-                        
-                        println!("[Discovery] Query sent. If found, try 'get' again in a moment.");
-                    }
-                } else {
-                    println!("Usage: get <NodeID> <Path>");
+                if parts.len() < 2 { println!("Usage: get <key>"); continue; }
+                // ... (保留旧的 get 逻辑用于原始数据)
+                if let Ok(bytes) = hex::decode(parts[1]) {
+                    let mut key = [0u8;32]; key.copy_from_slice(&bytes);
+                    let closest = { routing_table.lock().unwrap().closest_nodes(&key) };
+                    for (_, addr) in closest { send_signal(&transport, &keys, addr, Signal::FindValue(key)).await; }
                 }
             },
+            "quit" | "exit" => break,
             _ => println!("Unknown command."),
         }
     }
     Ok(())
 }
 
-async fn send_request(transport: &Arc<TransportLayer>, identity: &Arc<NodeIdentity>, peer: &crate::peers::PeerInfo, path: &str) -> Result<()> {
-    let req = format!("GET {}", path);
-    let pkt = ZeroPacket::new(identity, req.into_bytes(), MessageType::Request)?;
-    let env = SecureEnvelope::seal(identity, &peer.node_id, &serde_json::to_vec(&pkt)?)?;
-    let mut final_data = Vec::new();
-    final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
-    final_data.extend_from_slice(&serde_json::to_vec(&env)?);
-    transport.socket.send_to(&final_data, peer.addr).await?;
-    Ok(())
-}
-
-async fn network_listener(
-    transport: Arc<TransportLayer>,
-    identity: Arc<NodeIdentity>,
-    peer_manager: Arc<PeerManager>,
-    tx_response: mpsc::Sender<SafePage>
-) {
-    let mut buf = [0u8; 65535];
-    loop {
-        if let Ok((size, src_addr)) = transport.socket.recv_from(&mut buf).await {
-            let data = &buf[..size];
-            if data.len() <= 32 { continue; }
-
-            let sender_id_bytes = &data[0..32];
-            let envelope_bytes = &data[32..];
-            
-            if let Ok(sender_id) = ed25519_dalek::VerifyingKey::from_bytes(sender_id_bytes.try_into().unwrap()) {
-                // 自动学习 sender IP
-                peer_manager.add_peer(sender_id, src_addr);
-
-                if let Ok(env) = serde_json::from_slice::<SecureEnvelope>(envelope_bytes) {
-                    if let Ok(decrypted) = env.open(&identity, &sender_id) {
-                        if let Ok(packet) = serde_json::from_slice::<ZeroPacket>(&decrypted) {
-                            if packet.verify(&sender_id) {
-                                match packet.msg_type {
-                                    MessageType::Signal => {
-                                        // 处理信令 (Found)
-                                        if let Ok(signal) = serde_json::from_slice::<Signal>(&packet.payload) {
-                                            if let Signal::Found { id, addr } = signal {
-                                                println!("\n[Discovery] SUCCESS! Found {} at {}", &id[0..8], addr);
-                                                println!("zero> "); // 恢复提示符
-                                                io::stdout().flush().unwrap();
-                                                
-                                                // 注册发现的节点到 PeerManager
-                                                let _ = peer_manager.add_peer_from_hex(&id, &addr);
-                                            }
-                                        }
-                                    },
-                                    MessageType::Request => {
-                                        let req_str = String::from_utf8_lossy(&packet.payload);
-                                        let page = generate_page(&req_str, &identity);
-                                        if let Ok(resp_payload) = serde_json::to_vec(&page) {
-                                            if let Ok(resp_pkt) = ZeroPacket::new(&identity, resp_payload, MessageType::Response) {
-                                                if let Ok(resp_env) = SecureEnvelope::seal(&identity, &sender_id, &serde_json::to_vec(&resp_pkt).unwrap()) {
-                                                    let mut final_data = Vec::new();
-                                                    final_data.extend_from_slice(identity.get_public_key().to_bytes().as_slice());
-                                                    final_data.extend_from_slice(&serde_json::to_vec(&resp_env).unwrap());
-                                                    let _ = transport.socket.send_to(&final_data, src_addr).await;
-                                                }
-                                            }
-                                        }
-                                    },
-                                    MessageType::Response => {
-                                        if let Ok(page) = serde_json::from_slice::<SafePage>(&packet.payload) {
-                                            let _ = tx_response.send_timeout(page, Duration::from_millis(100)).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+fn render_json(json: &str) {
+    if let Ok(page) = serde_json::from_str::<SafePage>(json) {
+        page.render();
+    } else {
+        println!("Raw Data: {}", json);
     }
 }
 
-fn generate_page(req: &str, identity: &NodeIdentity) -> SafePage {
-    let req = req.trim();
-    match req {
-        "GET /index" | "GET /" => SafePage {
-            title: "Zero Node".to_string(),
-            elements: vec![
-                Element::Header("Welcome to Web 3.0".to_string()),
-                Element::Text(format!("Node: ...{}", &hex::encode(identity.get_public_key().to_bytes())[56..])),
-                Element::Text("Discovery: Bootnode Enabled".to_string()),
-            ],
+fn hash_content(s: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    hasher.finalize().into()
+}
+
+async fn send_signal(transport: &Arc<UdpTransport>, keys: &Arc<KeyStore>, addr: SocketAddr, signal: Signal) {
+    let payload_bytes = serde_json::to_vec(&signal).unwrap();
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let key = [0u8; 32]; 
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let ciphertext = cipher.encrypt(&nonce, payload_bytes.as_ref()).unwrap();
+    let envelope = SecureEnvelope { nonce: nonce.into(), ciphertext, sender_pubkey: keys.node_id() };
+    let packet = ZeroPacket { payload: serde_json::to_vec(&envelope).unwrap() };
+    transport.send(&packet, addr).await.ok();
+}
+
+fn decrypt_signal(_keys: &Arc<KeyStore>, envelope: &SecureEnvelope) -> Result<Signal, String> {
+    let key = [0u8; 32]; 
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| "Key err")?;
+    let plaintext = cipher.decrypt(&envelope.nonce.into(), envelope.ciphertext.as_ref()).map_err(|_| "Decrypt fail")?;
+    serde_json::from_slice(&plaintext).map_err(|e| e.to_string())
+}
+
+async fn handle_signal(
+    signal: Signal,
+    sender_id: NodeId,
+    addr: SocketAddr, 
+    rt: &Arc<Mutex<RoutingTable>>,
+    store: &Storage,
+    transport: &Arc<UdpTransport>,
+    keys: &Arc<KeyStore>
+) {
+    { let mut table = rt.lock().unwrap(); table.update(sender_id, addr); }
+
+    match signal {
+        Signal::Ping => { send_signal(transport, keys, addr, Signal::Pong).await; },
+        Signal::Pong => {},
+        Signal::FindNode(target) => {
+            let (closest, target_addr_opt) = {
+                let table = rt.lock().unwrap();
+                (table.closest_nodes(&target), table.get_addr(&target))
+            };
+            send_signal(transport, keys, addr, Signal::Neighbors(closest)).await;
+            if let Some(target_addr) = target_addr_opt {
+                if target != sender_id {
+                    send_signal(transport, keys, target_addr, Signal::Punch(sender_id, addr)).await;
+                }
+            }
         },
-        _ => SafePage {
-            title: "404".to_string(),
-            elements: vec![Element::Text("Not Found".to_string())],
-        }
+        Signal::Punch(req_id, req_addr) => {
+            send_signal(transport, keys, req_addr, Signal::Ping).await;
+            { let mut table = rt.lock().unwrap(); table.update(req_id, req_addr); }
+        },
+        Signal::Neighbors(peers) => {
+            let mut table = rt.lock().unwrap();
+            for (id, p_addr) in peers { table.update(id, p_addr); }
+        },
+        Signal::Store(key, val) => {
+            // 收到数据时，如果不显示太吵了，可以简化日志
+            // println!("DHT Stored Key: {}", hex::encode(key));
+            store.lock().unwrap().insert(key, val);
+        },
+        Signal::FindValue(key) => {
+            let val_opt = { store.lock().unwrap().get(&key).cloned() };
+            if let Some(val) = val_opt {
+                send_signal(transport, keys, addr, Signal::Value(key, val)).await;
+            } else {
+                let nodes = { rt.lock().unwrap().closest_nodes(&key) };
+                send_signal(transport, keys, addr, Signal::Neighbors(nodes)).await;
+            }
+        },
+        // Phase 8 Logic: 收到 Value 后尝试渲染
+        Signal::Value(_key, val) => {
+            // 如果是 JSON 页面结构，就渲染；否则打印原始内容
+            render_json(&val);
+        },
+        Signal::Message(txt) => { println!("MSG from {}: {}", addr, txt); }
     }
 }

@@ -1,49 +1,98 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use ed25519_dalek::VerifyingKey;
 use std::net::SocketAddr;
-use anyhow::{Result, anyhow};
+use crate::protocol::NodeId;
 
-#[derive(Clone)]
+pub const K_BUCKET_SIZE: usize = 20;
+const BUCKET_COUNT: usize = 256; 
+
+#[derive(Debug, Clone, Copy)]
 pub struct PeerInfo {
-    pub node_id: VerifyingKey, // Identity (Ed25519 Public Key)
-    pub addr: SocketAddr,      // Physical Address (IP:Port)
+    pub id: NodeId,
+    pub addr: SocketAddr,
 }
 
-#[derive(Clone)]
-pub struct PeerManager {
-    // 这里的 Key 使用 bytes 是因为 VerifyingKey 不直接支持作为 HashMap Key
-    peers: Arc<Mutex<HashMap<[u8; 32], PeerInfo>>>,
+pub struct RoutingTable {
+    local_id: NodeId,
+    buckets: Vec<Vec<PeerInfo>>,
 }
 
-impl PeerManager {
-    pub fn new() -> Self {
+impl RoutingTable {
+    pub fn new(local_id: NodeId) -> Self {
+        let mut buckets = Vec::with_capacity(BUCKET_COUNT);
+        for _ in 0..BUCKET_COUNT {
+            buckets.push(Vec::new());
+        }
         Self {
-            peers: Arc::new(Mutex::new(HashMap::new())),
+            local_id,
+            buckets,
         }
     }
 
-    pub fn add_peer(&self, node_id: VerifyingKey, addr: SocketAddr) {
-        let mut peers = self.peers.lock().unwrap();
-        peers.insert(node_id.to_bytes(), PeerInfo { node_id, addr });
+    fn distance_bucket_index(&self, other: &NodeId) -> usize {
+        let mut distinct_bits = 0;
+        // FIXED: 使用 _i 忽略未使用变量
+        for (_i, (a, b)) in self.local_id.iter().zip(other.iter()).enumerate() {
+            let xor = a ^ b;
+            if xor == 0 {
+                distinct_bits += 8;
+            } else {
+                distinct_bits += xor.leading_zeros() as usize;
+                break;
+            }
+        }
+        if distinct_bits >= 255 { 255 } else { distinct_bits }
     }
 
-    /// 通过 Hex 字符串和 IP 字符串手动注册一个 Peer
-    /// 用于 CLI 模式下 Client 手动指定 Server
-    pub fn add_peer_from_hex(&self, node_id_hex: &str, addr_str: &str) -> Result<()> {
-        let bytes = hex::decode(node_id_hex).map_err(|_| anyhow!("Invalid hex ID"))?;
-        let bytes_array: [u8; 32] = bytes.try_into().map_err(|_| anyhow!("Invalid ID length (must be 32 bytes)"))?;
-        let node_id = VerifyingKey::from_bytes(&bytes_array).map_err(|_| anyhow!("Invalid Key bytes"))?;
-        
-        let addr: SocketAddr = addr_str.parse().map_err(|_| anyhow!("Invalid IP address"))?;
-        
-        self.add_peer(node_id, addr);
-        // println!("[PeerManager] Manually added peer: {} @ {}", node_id_hex, addr);
-        Ok(())
+    pub fn update(&mut self, id: NodeId, addr: SocketAddr) {
+        if id == self.local_id { return; } 
+
+        let idx = self.distance_bucket_index(&id);
+        let bucket = &mut self.buckets[idx];
+
+        if let Some(pos) = bucket.iter().position(|p| p.id == id) {
+            let mut peer = bucket.remove(pos);
+            peer.addr = addr;
+            bucket.push(peer);
+        } else {
+            if bucket.len() < K_BUCKET_SIZE {
+                bucket.push(PeerInfo { id, addr });
+            }
+        }
     }
 
-    pub fn get_peer(&self, node_id_bytes: &[u8; 32]) -> Option<PeerInfo> {
-        let peers = self.peers.lock().unwrap();
-        peers.get(node_id_bytes).cloned()
+    pub fn closest_nodes(&self, target: &NodeId) -> Vec<(NodeId, SocketAddr)> {
+        let mut all_peers = Vec::new();
+        for bucket in &self.buckets {
+            for peer in bucket {
+                all_peers.push(*peer);
+            }
+        }
+
+        all_peers.sort_by(|a, b| {
+            let dist_a = xor_distance(&a.id, target);
+            let dist_b = xor_distance(&b.id, target);
+            dist_a.cmp(&dist_b)
+        });
+
+        all_peers.into_iter()
+            .take(K_BUCKET_SIZE)
+            .map(|p| (p.id, p.addr))
+            .collect()
     }
+
+    pub fn get_addr(&self, id: &NodeId) -> Option<SocketAddr> {
+        let idx = self.distance_bucket_index(id);
+        self.buckets[idx].iter().find(|p| p.id == *id).map(|p| p.addr)
+    }
+
+    pub fn list_all(&self) -> Vec<(NodeId, SocketAddr)> {
+        self.buckets.iter().flat_map(|b| b.clone()).map(|p| (p.id, p.addr)).collect()
+    }
+}
+
+fn xor_distance(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut res = [0u8; 32];
+    for i in 0..32 {
+        res[i] = a[i] ^ b[i];
+    }
+    res
 }

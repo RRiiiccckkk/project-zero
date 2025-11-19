@@ -4,14 +4,14 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-# 注意：必须开启 serde 特性
-ed25519-dalek = { version = "2.0", features = ["rand_core", "serde"] }
-x25519-dalek = { version = "2.0", features = ["static_secrets", "serde"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# FIXED: static_secret -> static_secrets
+x25519-dalek = { version = "2", features = ["static_secrets"] } 
 chacha20poly1305 = "0.10"
-rand = "0.8"
-anyhow = "1.0"
-clap = { version = "4.0", features = ["derive"] }
 hex = "0.4"
+rand = "0.8"
+sha2 = "0.10"

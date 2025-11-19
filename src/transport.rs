@@ -1,25 +1,38 @@
 use tokio::net::UdpSocket;
-use anyhow::Result;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::io;
+use crate::protocol::ZeroPacket;
 
-pub struct TransportLayer {
-    pub socket: UdpSocket,
+pub struct UdpTransport {
+    socket: Arc<UdpSocket>,
 }
 
-impl TransportLayer {
-    pub fn new(socket: UdpSocket) -> Self {
-        Self { socket }
+impl UdpTransport {
+    pub async fn new(addr: SocketAddr) -> io::Result<Self> {
+        let socket = UdpSocket::bind(addr).await?;
+        Ok(Self {
+            socket: Arc::new(socket),
+        })
     }
 
-    // 发送原始数据
-    pub async fn send(&self, data: &[u8], target: SocketAddr) -> Result<()> {
-        self.socket.send_to(data, target).await?;
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub async fn send(&self, packet: &ZeroPacket, target: SocketAddr) -> io::Result<()> {
+        let bytes = serde_json::to_vec(packet).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.socket.send_to(&bytes, target).await?;
         Ok(())
     }
 
-    // 接收原始数据
-    pub async fn recv(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        let (size, addr) = self.socket.recv_from(buf).await?;
-        Ok((size, addr))
+    pub async fn recv(&self) -> io::Result<(ZeroPacket, SocketAddr)> {
+        let mut buf = [0u8; 65535]; // UDP standard max size
+        let (len, addr) = self.socket.recv_from(&mut buf).await?;
+        
+        let packet: ZeroPacket = serde_json::from_slice(&buf[..len])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            
+        Ok((packet, addr))
     }
 }
