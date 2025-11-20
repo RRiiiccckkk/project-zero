@@ -1,110 +1,140 @@
-用户使用手册 (USER_GUIDE.md)
-code
-Markdown
-# Project Zero User Guide / 用户使用守则
+```markdown
+# Project Zero v0.3 User Guide / 用户使用手册
 
-## 1. 简介 (Introduction)
-Project Zero 是一个去中心化的 P2P 原型网络，实现了底层 UDP 通信、加密、DHT 路由、分布式存储以及一个基于文本终端 (TUI) 的去中心化浏览器。本手册将指导你如何操作节点。
-
-Project Zero is a decentralized P2P prototype network featuring UDP communication, encryption, DHT routing, distributed storage, and a terminal-based decentralized browser. This guide explains how to operate a node.
+**Version:** 0.3 (Secure Gossip Release)
+**Architecture:** ZeroUI + UDP + Ed25519 + DHT
 
 ---
 
-## 2. 启动与组网 (Startup & Networking)
+## 📖 目录 (Table of Contents)
+1.  [快速启动 (Quick Start)](#1-快速启动-quick-start)
+2.  [通用界面指南 (General Interface)](#2-通用界面指南-general-interface)
+3.  [开发者高级指南 (Developer's Guide)](#3-开发者高级指南-developers-guide)
+    *   [构建网络拓扑 (Network Topology)](#31-构建网络拓扑)
+    *   [Gossip 广播机制验证](#32-gossip-广播机制验证)
+    *   [入侵与防御测试 (Security Audit)](#33-入侵与防御测试-security-audit)
+4.  [故障排查 (Troubleshooting)](#4-故障排查-troubleshooting)
 
-### 启动节点 (Start Node)
-默认情况下，节点会绑定到随机端口。
-By default, the node binds to a random port.
+---
 
+## 1. 快速启动 (Quick Start)
+
+Project Zero v0.3 是一个独立的 P2P 节点程序。要模拟去中心化网络，你需要同时运行多个实例。
+
+### 启动节点
+打开终端，运行以下命令：
 ```bash
-# 普通启动 / Normal Start
 cargo run
+```
+*建议：打开 2~3 个独立的终端窗口，分别运行该命令，以模拟不同的网络节点。*
 
-# 指定端口启动 (例如 Bootnode) / Bind specific port
-cargo run -- --bind 127.0.0.1:9999
-加入网络 (Bootstrap)
-新节点启动后是孤立的，必须连接到一个已知节点（Bootnode）才能加入 DHT 网络。
-A new node is isolated. You must connect to a known node (Bootnode) to join the DHT.
+---
 
-code
-Bash
-# 语法 / Syntax: bootstrap <ip:port>
-> bootstrap 127.0.0.1:9999
-查看邻居 (View Peers)
-查看当前路由表（K-Buckets）中已发现的节点。
-View discovered nodes in your routing table.
+## 2. 通用界面指南 (General Interface)
 
-code
-Bash
-> peers
-查看自身 ID (View Self ID)
-显示当前节点的公钥 ID（32字节 Hex）。
-Show current node's public key ID.
+启动后，你将看到 **ZeroUI** 图形界面。
 
-code
-Bash
-> id
-3. 社交与通信 (Social & Messaging)
+### 2.1 顶部控制栏 (Top Control Bar)
+这是节点的控制中枢，从左到右依次为：
 
-查找节点 (Find Node)
-在网络中定位某个节点 ID。如果目标在 NAT 后面，系统会尝试进行打洞 (Hole Punching)。
-Locate a node ID in the network. If behind NAT, hole punching is attempted.
+*   **🔌 Peers (节点数)**:
+    显示当前节点路由表中已连接的邻居数量。初始为 0。
+*   **🔒 Verified (安全状态)**:
+    显示当前主视图内容的来源签名。
+    *   `System (Local)`: 显示的是本地默认内容。
+    *   `<Hex_Key>` (绿色): 显示的是来自远程节点的、签名验证通过的安全内容。
+*   **Bootstrap IP (引导入口)**:
+    *   用于输入你想连接的第一个节点的地址（例如 `127.0.0.1:8000`）。
+    *   点击 **[Join]** 按钮进行连接。
+*   **📡 Broadcast (广播按钮)**:
+    *   点击后，将把自己当前的 UI 蓝图签名并广播给所有已知节点。
 
-code
-Bash
-# 语法 / Syntax: find <NodeID_Hex>
-> find 56f9605182337d69...
-发送私信 (Direct Message)
-向指定 ID 发送端到端加密消息。
-Send E2E encrypted message to a specific ID.
+### 2.2 主视图 (Main View)
+屏幕中央的白色/灰色区域是 **"投影区"**。
+*   **特性**: 这里不包含任何本地硬编码逻辑。它完全由接收到的 JSON 数据包驱动渲染。
+*   **交互**: 如果远程蓝图中包含按钮（如 Ping），点击它会发送回执信号。
 
-code
-Bash
-# 语法 / Syntax: msg <NodeID_Hex> <Message>
-> msg 56f9605182337d69... Hello World!
-4. 分布式存储与 Web 3.0 (Storage & Web 3.0)
-这是 Project Zero 的核心功能：去中心化内容发布与浏览。
-Core feature: Decentralized content publishing and browsing.
+### 2.3 底部日志面板 (System Logs)
+位于窗口最底部。
+*   这是了解节点底层行为的窗口。
+*   它会显示：数据包接收、握手状态、签名验证结果、Gossip 转发记录等。
 
-发布网页 (Publish Page)
-将内置的 SafePage (JSON 格式) 发布到 DHT 网络中。发布成功后，网络会返回一个 Content Key。
-Publish the built-in SafePage to the DHT. Upon success, the network returns a Content Key.
+---
 
-code
-Bash
-> publish
+## 3. 开发者高级指南 (Developer's Guide)
 
-# 输出示例 / Output Example:
-# Publishing Page...
-# Page Key: a0e9776a0bdd1f31dfd4d4d998bfe740501d7d4c1d00f976504565eee33d4ae0
-⚠️ 注意/Note: 请务必保存返回的 Page Key，这是访问该网页的唯一凭证。
+本章节适用于理解协议流、调试网络以及验证安全性的开发者。
 
-浏览网页 (Browse Page)
-使用 Key 从网络下载数据，并渲染为可视化页面。
-Download and render the page using its Key.
+### 3.1 构建网络拓扑
+为了测试 Gossip 协议，你需要构建一个链式或网状结构。
 
-code
-Bash
-# 语法 / Syntax: browse <Content_Key>
-> browse a0e9776a0bdd1f31dfd4d4d998bfe740501d7d4c1d00f976504565eee33d4ae0
-原始数据存取 (Raw Data I/O)
-如果你只想存储简单的字符串数据：
-For storing simple raw strings:
+**场景：构建 A -> B -> C 链路**
 
-code
-Bash
-# 存储 / Put
-> put MySecretData
-# (返回 Key / Returns Key)
+1.  **获取端口**: 启动三个节点，查看各自底部日志的第一行：
+    *   节点 A: `Secure Node started on port 8000`
+    *   节点 B: `Secure Node started on port 8001`
+    *   节点 C: `Secure Node started on port 8002`
+2.  **连接 B 到 A**:
+    *   在节点 B 的 `Bootstrap IP` 输入 `127.0.0.1:8000`，点击 **[Join]**。
+    *   *检查*: B 的 Peers 变为 1，A 的 Peers 变为 1。
+3.  **连接 C 到 B**:
+    *   在节点 C 的 `Bootstrap IP` 输入 `127.0.0.1:8001`，点击 **[Join]**。
+    *   *检查*: C 的 Peers 变为 1 (连了 B)，B 的 Peers 变为 2 (连了 A 和 C)。
 
-# 获取 / Get
-> get <Key>
-5. 常见问题 (FAQ)
-Q: 为什么 bootstrap 后 peers 还是空的？
-A: bootstrap 发送的是 UDP 包。如果 Bootnode 未运行或防火墙拦截，将无响应。请确认 IP 和端口正确。
+### 3.2 Gossip 广播机制验证
+验证消息是否能通过中间节点转发。
 
-Q: 什么是 NAT 穿透？
-A: 当两个节点都在家用路由器后面时，直接通信会被拦截。Project Zero 使用“打洞”技术，通过 Bootnode 协调，让双方路由器允许通信。
+1.  在 **节点 A** 上点击 **[📡 Broadcast]**。
+2.  **观察节点 C**:
+    *   虽然 C 没有直接连接 A，但 C 的界面应瞬间变为 A 的金色欢迎界面。
+    *   顶部状态栏应显示：`🔒 Verified: <NodeA_PublicKey>`。
+3.  **观察节点 B (中继者)**:
+    *   检查 B 的底部日志，应包含：`>> Relayed to 1 peers.`
+    *   *原理解析*: B 收到 A 的包，验证签名通过，查表发现 C，遂将包转发给 C。
 
-Q: 数据存在哪里？
-A: 数据存储在距离 Key 最近的 K 个节点的内存中 (HashMap)。当前版本重启节点会导致数据丢失（纯内存模式）。
+### 3.3 入侵与防御测试 (Security Audit)
+v0.3 内置了 **Intruder Mode (入侵模式)**，用于验证 Ed25519 签名拦截机制。
+
+#### 第一步：确定攻击目标
+假设 **节点 A** 想攻击 **节点 B**。
+*   首先，你需要知道 **节点 B** 的确切监听端口（查看节点 B 的窗口标题或首行日志，例如 `8001`）。
+
+#### 第二步：配置攻击向量
+在 **节点 A** 的界面顶部，最右侧：
+1.  找到红色的 **[😈 Attack]** 按钮。
+2.  **关键步骤**: 在红色按钮**左侧的小输入框**中，输入受害者地址：
+    `127.0.0.1:8001`
+    *(注意：不要输错成 Bootstrap 的输入框，也不要输错端口)*
+
+#### 第三步：发动攻击与取证
+1.  点击 **[😈 Attack]**。
+2.  **攻击者 (A) 日志**:
+    `🚀 Launching SPOOFED packet...` (发送了签名最后一字节被反转的恶意包)。
+3.  **受害者 (B) 取证**:
+    *   **界面表现**: 界面**必须**保持原样，不能出现红色的 "HACKED" 警告。
+    *   **日志取证**: 底部日志**必须**出现以下红字警告：
+        ```text
+        🛡️ BLOCKED: Fake/Tampered packet from 127.0.0.1:XXXX
+        ```
+
+---
+
+## 4. 故障排查 (Troubleshooting)
+
+**Q: 为什么点击 Attack 后，受害者的日志没有任何反应？**
+*   **A**: 你可能攻击了错误的端口（例如打到了空端口）。请务必检查受害者窗口第一行日志 `Started on port XXXX`，并确保攻击者输入框里的地址与之一致。
+
+**Q: 为什么我看不到 "Relayed" 日志？**
+*   **A**: 只有**中间节点**会打印 Relayed。
+    *   A -> B: 没人转发。
+    *   A -> B -> C: A 广播，B 会打印 Relayed（转发给 C）。
+
+**Q: 为什么广播一次后，再点广播没有反应？**
+*   **A**: 系统内置了**去重缓存 (Deduplication)**。如果你短时间内发送完全相同的包（Nonce 相同），接收方会视为重复包直接丢弃。v0.3 的广播按钮每次点击都会生成新的随机 Nonce，所以通常都会刷新。
+
+**Q: 这个系统真的没有 Web 服务器吗？**
+*   **A**: 是的。没有 Nginx，没有 Apache，没有 HTML。你看到的每一个像素都是由 Rust 代码解析 UDP 数据包后直接绘制在 GPU 上的。
+
+---
+
+> **Project Zero** - *Rebuilding the Internet, one packet at a time.*

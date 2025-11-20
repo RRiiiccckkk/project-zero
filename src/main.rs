@@ -1,284 +1,451 @@
+// src/main.rs
+// Phase 13: Intruder Simulation & Security Verification
+
 mod protocol;
-mod transport;
-mod peers;
-mod safedoc;
+mod transport; 
+mod peers;     
+mod zeroui;
 
-use clap::Parser;
-use std::net::SocketAddr;
-use tokio::sync::mpsc;
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use eframe::egui;
 use std::collections::HashMap;
-use rand::rngs::OsRng;
-use ed25519_dalek::SigningKey;
-use x25519_dalek::StaticSecret;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadCore};
-use chacha20poly1305::aead::Aead;
-use hex;
-use sha2::{Sha256, Digest};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 
-use protocol::{Signal, ZeroPacket, SecureEnvelope, NodeId};
+use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey, Signature};
+use rand::rngs::OsRng;
+
+use protocol::{ZeroPacket, Payload};
 use transport::UdpTransport;
 use peers::RoutingTable;
-use safedoc::SafePage;
+use zeroui::{Blueprint, Widget, Direction};
 
-#[derive(Parser)]
-#[command(name = "project-zero")]
-struct Cli {
-    #[arg(short, long, default_value = "0.0.0.0:0")]
-    bind: String,
+enum NetEvent {
+    Log(String),
+    NewBlueprint(Blueprint, String), 
+    PeerUpdate(usize),
 }
 
-struct KeyStore {
-    sign_key: SigningKey,
-    #[allow(dead_code)]
-    ecdh_secret: StaticSecret,
+enum GuiCommand {
+    Bootstrap { target_addr: SocketAddr },
+    BroadcastUI,
+    // 新增：攻击指令
+    Attack { target_addr: SocketAddr },
+    SendAction { op: String, param: String },
 }
 
-impl KeyStore {
-    fn new() -> Self {
-        let mut csprng = OsRng;
-        let sign_key = SigningKey::generate(&mut csprng);
-        let ecdh_secret = StaticSecret::random_from_rng(&mut csprng);
-        Self { sign_key, ecdh_secret }
+struct ZeroApp {
+    blueprint: Blueprint,
+    verified_source: String,
+    input_state: HashMap<String, String>,
+    logs: Vec<String>,
+    peer_count: usize,
+    rx_net: std::sync::mpsc::Receiver<NetEvent>,
+    tx_gui: mpsc::Sender<GuiCommand>,
+}
+
+impl ZeroApp {
+    fn new(
+        cc: &eframe::CreationContext, 
+        rx_net: std::sync::mpsc::Receiver<NetEvent>,
+        tx_gui: mpsc::Sender<GuiCommand>,
+        local_port: u16
+    ) -> Self {
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        Self {
+            blueprint: zeroui::splash_screen(local_port),
+            verified_source: "System (Local)".into(),
+            input_state: HashMap::new(),
+            logs: vec![format!("Secure Node started on port {}.", local_port)],
+            peer_count: 0,
+            rx_net,
+            tx_gui,
+        }
     }
-    
-    fn node_id(&self) -> NodeId {
-        self.sign_key.verifying_key().to_bytes()
+
+    fn render_widget(&mut self, ui: &mut egui::Ui, widget: &Widget) {
+        match widget {
+            Widget::Container { direction, children, padding, spacing } => {
+                let layout = match direction {
+                    Direction::Horizontal => egui::Layout::left_to_right(egui::Align::Center),
+                    Direction::Vertical => egui::Layout::top_down(egui::Align::Min),
+                };
+                egui::Frame::none().inner_margin(padding.unwrap_or(0.0)).show(ui, |ui| {
+                    ui.with_layout(layout, |ui| {
+                        if let Some(s) = spacing { ui.spacing_mut().item_spacing = egui::vec2(*s, *s); }
+                        for child in children { self.render_widget(ui, child); }
+                    });
+                });
+            }
+            Widget::Text { content, size, color } => {
+                let mut txt = egui::RichText::new(content);
+                if let Some(s) = size { txt = txt.size(*s); }
+                if let Some(c) = color { if let Ok(col) = parse_color(c) { txt = txt.color(col); } }
+                ui.label(txt);
+            }
+            Widget::Input { id, placeholder } => {
+                let val = self.input_state.entry(id.clone()).or_insert(String::new());
+                ui.add(egui::TextEdit::singleline(val).hint_text(placeholder));
+            }
+            Widget::Button { label, action_op, action_param } => {
+                if ui.button(label).clicked() {
+                    let val = self.input_state.get(action_param).cloned().unwrap_or(action_param.clone());
+                    let _ = self.tx_gui.try_send(GuiCommand::SendAction {
+                        op: action_op.clone(),
+                        param: val,
+                    });
+                }
+            }
+        }
     }
 }
 
-type Storage = Arc<Mutex<HashMap<[u8; 32], String>>>;
+impl eframe::App for ZeroApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(event) = self.rx_net.try_recv() {
+            match event {
+                NetEvent::Log(msg) => self.logs.push(msg),
+                NetEvent::NewBlueprint(bp, source) => {
+                    self.blueprint = bp;
+                    self.verified_source = source;
+                },
+                NetEvent::PeerUpdate(count) => self.peer_count = count,
+            }
+        }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    let socket_addr: SocketAddr = cli.bind.parse()?;
+        egui::TopBottomPanel::top("net_controls").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(format!("🔌 Peers: {}", self.peer_count));
+                
+                // 正常的 Bootstrap
+                let boot_val = self.input_state.entry("bootstrap_ip".into()).or_insert("127.0.0.1:8000".into());
+                ui.add(egui::TextEdit::singleline(boot_val).desired_width(100.0).hint_text("IP"));
+                if ui.button("Join").clicked() {
+                    if let Ok(addr) = boot_val.parse::<SocketAddr>() {
+                        let _ = self.tx_gui.try_send(GuiCommand::Bootstrap { target_addr: addr });
+                    }
+                }
+                
+                ui.separator();
+                
+                // 广播
+                if ui.button("📡 Broadcast").clicked() {
+                    let _ = self.tx_gui.try_send(GuiCommand::BroadcastUI);
+                    self.logs.push("Broadcasting verified UI...".into());
+                }
+
+                ui.separator();
+
+                // --- INTRUDER CONTROLS ---
+                // 攻击特定 IP
+                let attack_val = self.input_state.entry("attack_ip".into()).or_insert("127.0.0.1:8000".into());
+                ui.add(egui::TextEdit::singleline(attack_val).desired_width(100.0).hint_text("Target IP"));
+                
+                // 红色按钮：模拟攻击
+                if ui.add(egui::Button::new("😈 Attack").fill(egui::Color32::from_rgb(200, 50, 50))).clicked() {
+                    if let Ok(addr) = attack_val.parse::<SocketAddr>() {
+                        let _ = self.tx_gui.try_send(GuiCommand::Attack { target_addr: addr });
+                        self.logs.push(format!("🚀 Launching SPOOFED packet to {}...", addr));
+                    }
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // 显示当前验证状态
+                ui.horizontal(|ui| {
+                    ui.label("Current View Source:");
+                    ui.colored_label(egui::Color32::GREEN, &self.verified_source);
+                });
+                ui.separator();
+                
+                let root = self.blueprint.root.clone();
+                self.render_widget(ui, &root);
+            });
+        });
+
+        egui::TopBottomPanel::bottom("logs").max_height(150.0).show(ctx, |ui| {
+            ui.separator();
+            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                for log in &self.logs {
+                    ui.monospace(log);
+                }
+            });
+        });
+        
+        ctx.request_repaint();
+    }
+}
+
+async fn run_network_layer(
+    local_port: u16,
+    tx_net: std::sync::mpsc::Sender<NetEvent>,
+    mut rx_gui: mpsc::Receiver<GuiCommand>
+) {
+    let addr = SocketAddr::from(([0, 0, 0, 0], local_port));
+    println!("\n=== SECURE ZERONET NODE ON PORT {} ===\n", local_port);
+
+    let transport = match UdpTransport::new(addr).await {
+        Ok(t) => Arc::new(t),
+        Err(e) => { println!("[FATAL] Bind Error: {}", e); return; }
+    };
+
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let local_pubkey = signing_key.verifying_key();
+    let local_id = local_pubkey.to_bytes();
+
+    let routing_table = Arc::new(Mutex::new(RoutingTable::new(local_id)));
     
-    let keys = Arc::new(KeyStore::new());
-    let my_id = keys.node_id();
-    println!("Node Started. ID: {}", hex::encode(my_id));
+    let short_id = hex::encode(&local_id[0..4]);
+    let _ = tx_net.send(NetEvent::Log(format!("Identity: {}... (Ed25519)", short_id)));
 
-    let transport: Arc<UdpTransport> = Arc::new(UdpTransport::new(socket_addr).await?);
-    println!("Listening on: {}", transport.local_addr()?);
+    let mut seen_packets: Vec<([u8;32], u64)> = Vec::new();
 
-    let routing_table = Arc::new(Mutex::new(RoutingTable::new(my_id)));
-    let storage: Storage = Arc::new(Mutex::new(HashMap::new()));
+    let my_dashboard = Blueprint {
+        title: format!("Secure Space: {}", short_id),
+        root: Widget::Container {
+            direction: Direction::Vertical,
+            padding: Some(20.0),
+            spacing: Some(10.0),
+            children: vec![
+                Widget::Text { 
+                    content: format!("Identity: Node {}", short_id), 
+                    size: Some(24.0), 
+                    color: Some("#00FF88".into()) 
+                },
+                Widget::Text { 
+                    content: "This content is trusted.".into(), 
+                    size: None, color: None 
+                },
+                Widget::Button { label: "Ping".into(), action_op: "ping".into(), action_param: "".into() }
+            ]
+        }
+    };
 
-    let (tx_cmd, mut rx_cmd) = mpsc::channel::<String>(32);
+    loop {
+        tokio::select! {
+            res = transport.recv() => {
+                match res {
+                    Ok((packet, src_addr)) => {
+                        // --- SECURITY LAYER ---
+                        let sender_pubkey = match VerifyingKey::from_bytes(&packet.sender_id) {
+                            Ok(pk) => pk,
+                            Err(_) => { continue; }
+                        };
 
-    let t_recv = transport.clone();
-    let keys_recv = keys.clone();
-    let rt_recv = routing_table.clone();
-    let store_recv = storage.clone();
+                        if packet.signature.len() != 64 { continue; }
+                        let mut sig_bytes = [0u8; 64];
+                        sig_bytes.copy_from_slice(&packet.signature);
+                        let signature = Signature::from_bytes(&sig_bytes);
 
-    tokio::spawn(async move {
-        loop {
-            match t_recv.recv().await {
-                Ok((packet, addr)) => {
-                    if let Ok(envelope) = serde_json::from_slice::<SecureEnvelope>(&packet.payload) {
-                        let sender_id = envelope.sender_pubkey;
-                        if let Ok(signal) = decrypt_signal(&keys_recv, &envelope) {
-                            handle_signal(signal, sender_id, addr, &rt_recv, &store_recv, &t_recv, &keys_recv).await;
+                        let signable_data = ZeroPacket::get_signable_bytes(packet.nonce, &packet.payload);
+                        
+                        // 核心验证逻辑：如果这里失败，直接丢弃
+                        if sender_pubkey.verify(&signable_data, &signature).is_err() {
+                            let _ = tx_net.send(NetEvent::Log(format!("🛡️ BLOCKED: Fake/Tampered packet from {}", src_addr)));
+                            println!("[SEC] BLOCKED ATTACK from {}", src_addr);
+                            continue; // DROP THE PACKET
+                        }
+                        // ----------------------
+
+                        let msg_key = (packet.sender_id, packet.nonce);
+                        if seen_packets.contains(&msg_key) {
+                             match packet.payload {
+                                Payload::Ping | Payload::Pong | Payload::FindNode(_) | Payload::Neighbors(_) => {}, 
+                                _ => continue 
+                            }
+                        } else {
+                            seen_packets.push(msg_key);
+                            if seen_packets.len() > 100 { seen_packets.remove(0); }
+                        }
+
+                        let peer_count = {
+                            let mut rt = routing_table.lock().unwrap();
+                            rt.update(packet.sender_id, src_addr);
+                            rt.count()
+                        };
+                        let _ = tx_net.send(NetEvent::PeerUpdate(peer_count));
+
+                        match packet.payload {
+                            Payload::Ping => {
+                                send_signed_packet(&transport, &signing_key, local_id, packet.nonce, Payload::Pong, src_addr).await;
+                            },
+                            Payload::Pong => {},
+                            Payload::FindNode(_) => {
+                                let peers = routing_table.lock().unwrap().known_peers();
+                                send_signed_packet(&transport, &signing_key, local_id, 0, Payload::Neighbors(peers), src_addr).await;
+                            },
+                            Payload::Neighbors(peers) => {
+                                {
+                                    let mut rt = routing_table.lock().unwrap();
+                                    for p in peers { rt.update(p.id, p.addr); }
+                                }
+                                let count = routing_table.lock().unwrap().count();
+                                let _ = tx_net.send(NetEvent::PeerUpdate(count));
+                            },
+                            Payload::UiBlueprint(ref bp) => {
+                                let source_id = hex::encode(&packet.sender_id[0..4]);
+                                let _ = tx_net.send(NetEvent::NewBlueprint(bp.clone(), source_id.clone()));
+                                let _ = tx_net.send(NetEvent::Log(format!("Verified UI from {}", source_id)));
+
+                                let neighbors = routing_table.lock().unwrap().known_peers();
+                                for peer in neighbors {
+                                    if peer.addr != src_addr && peer.id != local_id {
+                                        let _ = transport.send(&packet, peer.addr).await;
+                                    }
+                                }
+                            },
+                            Payload::UiAction { .. } => {}
                         }
                     }
+                    Err(e) => println!("Recv Err: {}", e),
                 }
-                Err(e) => eprintln!("Receive error: {}", e),
             }
-        }
-    });
 
-    tokio::spawn(async move {
-        let stdin = io::stdin();
-        loop {
-            print!("> ");
-            io::stdout().flush().unwrap();
-            let mut line = String::new();
-            if stdin.read_line(&mut line).is_ok() {
-                let _ = tx_cmd.send(line.trim().to_string()).await;
-            }
-        }
-    });
-
-    while let Some(cmd) = rx_cmd.recv().await {
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() { continue; }
-
-        match parts[0] {
-            "id" => println!("My ID: {}", hex::encode(my_id)),
-            "peers" => {
-                let rt = routing_table.lock().unwrap();
-                let peers = rt.list_all();
-                println!("Known Peers: {}", peers.len());
-                for (id, addr) in peers {
-                    println!(" - {} @ {}", hex::encode(id), addr);
-                }
-            },
-            "bootstrap" => {
-                if parts.len() < 2 { println!("Usage: bootstrap <ip:port>"); continue; }
-                if let Ok(addr) = parts[1].parse::<SocketAddr>() {
-                    println!("Bootstrapping via {}", addr);
-                    send_signal(&transport, &keys, addr, Signal::FindNode(keys.node_id())).await;
-                }
-            },
-            // Phase 8: 发布页面
-            "publish" => {
-                // 创建一个示例页面并发布
-                let page = SafePage::example();
-                let json = serde_json::to_string(&page).unwrap();
-                
-                let key = hash_content(&json);
-                println!("Publishing Page...");
-                println!("Page Key: \x1b[32m{}\x1b[0m", hex::encode(key)); // Green Key
-                
-                let closest = { routing_table.lock().unwrap().closest_nodes(&key) };
-                if closest.is_empty() {
-                    storage.lock().unwrap().insert(key, json);
-                    println!("Stored locally.");
-                } else {
-                    for (_, addr) in closest {
-                        send_signal(&transport, &keys, addr, Signal::Store(key, json.clone())).await;
-                    }
-                    println!("Sent to network.");
-                }
-            },
-            // Phase 8: 浏览 (渲染) 页面
-            "browse" => {
-                if parts.len() < 2 { println!("Usage: browse <key_hex>"); continue; }
-                if let Ok(key_bytes) = hex::decode(parts[1]) {
-                    if key_bytes.len() == 32 {
-                        let mut key = [0u8; 32];
-                        key.copy_from_slice(&key_bytes);
-                        
-                        // 1. 先查本地
-                        let local_val = { storage.lock().unwrap().get(&key).cloned() };
-                        if let Some(val) = local_val {
-                            render_json(&val);
-                        } else {
-                            // 2. 查网络 (注意：这里简化了逻辑，真实浏览器应该挂起等待结果)
-                            // 这里的 browse 只是发送请求，结果会在 handle_signal 里异步打印。
-                            // 为了演示，我们通过特殊的 Signal::FindValue 触发，但 handle_signal 需要知道如何处理渲染。
-                            // 简化方案：Handle Signal 收到 Value 后，尝试解析为 SafePage，如果成功则渲染。
-                            println!("Fetching page from DHT...");
-                            let closest = { routing_table.lock().unwrap().closest_nodes(&key) };
-                            for (_, addr) in closest {
-                                send_signal(&transport, &keys, addr, Signal::FindValue(key)).await;
+            cmd = rx_gui.recv() => {
+                if let Some(command) = cmd {
+                    match command {
+                        GuiCommand::Bootstrap { target_addr } => {
+                            send_signed_packet(&transport, &signing_key, local_id, 0, Payload::FindNode(local_id), target_addr).await;
+                        },
+                        GuiCommand::BroadcastUI => {
+                            let targets = routing_table.lock().unwrap().known_peers();
+                            let nonce = rand::random::<u64>();
+                            seen_packets.push((local_id, nonce));
+                            for peer in &targets {
+                                send_signed_packet(&transport, &signing_key, local_id, nonce, Payload::UiBlueprint(my_dashboard.clone()), peer.addr).await;
+                            }
+                            let _ = tx_net.send(NetEvent::Log(format!("Signed & Broadcasted to {} peers.", targets.len())));
+                        },
+                        // --- INTRUDER LOGIC ---
+                        GuiCommand::Attack { target_addr } => {
+                             send_malicious_packet(&transport, &signing_key, local_id, target_addr).await;
+                        },
+                        // ----------------------
+                        GuiCommand::SendAction { op, param } => {
+                             if op == "connect_ip" {
+                                if let Ok(addr) = param.parse::<SocketAddr>() {
+                                     send_signed_packet(&transport, &signing_key, local_id, 0, Payload::FindNode(local_id), addr).await;
+                                }
                             }
                         }
                     }
                 }
-            },
-            "put" => {
-                 if parts.len() < 2 { println!("Usage: put <content>"); continue; }
-                 let content = parts[1..].join(" ");
-                 let key = hash_content(&content);
-                 println!("Key: {}", hex::encode(key));
-                 let closest = { routing_table.lock().unwrap().closest_nodes(&key) };
-                 for (_, addr) in closest {
-                     send_signal(&transport, &keys, addr, Signal::Store(key, content.clone())).await;
-                 }
-            },
-            "get" => {
-                if parts.len() < 2 { println!("Usage: get <key>"); continue; }
-                // ... (保留旧的 get 逻辑用于原始数据)
-                if let Ok(bytes) = hex::decode(parts[1]) {
-                    let mut key = [0u8;32]; key.copy_from_slice(&bytes);
-                    let closest = { routing_table.lock().unwrap().closest_nodes(&key) };
-                    for (_, addr) in closest { send_signal(&transport, &keys, addr, Signal::FindValue(key)).await; }
-                }
-            },
-            "quit" | "exit" => break,
-            _ => println!("Unknown command."),
+            }
         }
     }
-    Ok(())
 }
 
-fn render_json(json: &str) {
-    if let Ok(page) = serde_json::from_str::<SafePage>(json) {
-        page.render();
-    } else {
-        println!("Raw Data: {}", json);
-    }
-}
-
-fn hash_content(s: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hasher.finalize().into()
-}
-
-async fn send_signal(transport: &Arc<UdpTransport>, keys: &Arc<KeyStore>, addr: SocketAddr, signal: Signal) {
-    let payload_bytes = serde_json::to_vec(&signal).unwrap();
-    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let key = [0u8; 32]; 
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let ciphertext = cipher.encrypt(&nonce, payload_bytes.as_ref()).unwrap();
-    let envelope = SecureEnvelope { nonce: nonce.into(), ciphertext, sender_pubkey: keys.node_id() };
-    let packet = ZeroPacket { payload: serde_json::to_vec(&envelope).unwrap() };
-    transport.send(&packet, addr).await.ok();
-}
-
-fn decrypt_signal(_keys: &Arc<KeyStore>, envelope: &SecureEnvelope) -> Result<Signal, String> {
-    let key = [0u8; 32]; 
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| "Key err")?;
-    let plaintext = cipher.decrypt(&envelope.nonce.into(), envelope.ciphertext.as_ref()).map_err(|_| "Decrypt fail")?;
-    serde_json::from_slice(&plaintext).map_err(|e| e.to_string())
-}
-
-async fn handle_signal(
-    signal: Signal,
-    sender_id: NodeId,
-    addr: SocketAddr, 
-    rt: &Arc<Mutex<RoutingTable>>,
-    store: &Storage,
+async fn send_signed_packet(
     transport: &Arc<UdpTransport>,
-    keys: &Arc<KeyStore>
+    key: &SigningKey,
+    local_id: [u8; 32],
+    nonce: u64,
+    payload: Payload,
+    target: SocketAddr
 ) {
-    { let mut table = rt.lock().unwrap(); table.update(sender_id, addr); }
+    let signable_data = ZeroPacket::get_signable_bytes(nonce, &payload);
+    let signature: Signature = key.sign(&signable_data);
+    
+    let packet = ZeroPacket {
+        sender_id: local_id,
+        nonce,
+        signature: signature.to_bytes().to_vec(),
+        payload,
+    };
+    let _ = transport.send(&packet, target).await;
+}
 
-    match signal {
-        Signal::Ping => { send_signal(transport, keys, addr, Signal::Pong).await; },
-        Signal::Pong => {},
-        Signal::FindNode(target) => {
-            let (closest, target_addr_opt) = {
-                let table = rt.lock().unwrap();
-                (table.closest_nodes(&target), table.get_addr(&target))
-            };
-            send_signal(transport, keys, addr, Signal::Neighbors(closest)).await;
-            if let Some(target_addr) = target_addr_opt {
-                if target != sender_id {
-                    send_signal(transport, keys, target_addr, Signal::Punch(sender_id, addr)).await;
+// --- THE ATTACK FUNCTION ---
+async fn send_malicious_packet(
+    transport: &Arc<UdpTransport>,
+    key: &SigningKey,
+    local_id: [u8; 32],
+    target: SocketAddr
+) {
+    // 1. 构造一个恶意的 UI Payload
+    let evil_blueprint = Blueprint {
+        title: "HACKED SYSTEM".into(),
+        root: Widget::Container {
+            direction: Direction::Vertical,
+            padding: Some(50.0),
+            spacing: Some(20.0),
+            children: vec![
+                Widget::Text { 
+                    content: "⚠️ YOU HAVE BEEN HACKED ⚠️".into(), 
+                    size: Some(32.0), 
+                    color: Some("#FF0000".into()) 
+                },
+                Widget::Text { 
+                    content: "Your cryptographic layer failed.".into(), 
+                    size: Some(16.0), color: Some("#FFFFFF".into()) 
                 }
-            }
-        },
-        Signal::Punch(req_id, req_addr) => {
-            send_signal(transport, keys, req_addr, Signal::Ping).await;
-            { let mut table = rt.lock().unwrap(); table.update(req_id, req_addr); }
-        },
-        Signal::Neighbors(peers) => {
-            let mut table = rt.lock().unwrap();
-            for (id, p_addr) in peers { table.update(id, p_addr); }
-        },
-        Signal::Store(key, val) => {
-            // 收到数据时，如果不显示太吵了，可以简化日志
-            // println!("DHT Stored Key: {}", hex::encode(key));
-            store.lock().unwrap().insert(key, val);
-        },
-        Signal::FindValue(key) => {
-            let val_opt = { store.lock().unwrap().get(&key).cloned() };
-            if let Some(val) = val_opt {
-                send_signal(transport, keys, addr, Signal::Value(key, val)).await;
-            } else {
-                let nodes = { rt.lock().unwrap().closest_nodes(&key) };
-                send_signal(transport, keys, addr, Signal::Neighbors(nodes)).await;
-            }
-        },
-        // Phase 8 Logic: 收到 Value 后尝试渲染
-        Signal::Value(_key, val) => {
-            // 如果是 JSON 页面结构，就渲染；否则打印原始内容
-            render_json(&val);
-        },
-        Signal::Message(txt) => { println!("MSG from {}: {}", addr, txt); }
+            ]
+        }
+    };
+    
+    let nonce = rand::random::<u64>();
+    let payload = Payload::UiBlueprint(evil_blueprint);
+    
+    // 2. 进行正常签名
+    let signable_data = ZeroPacket::get_signable_bytes(nonce, &payload);
+    let signature: Signature = key.sign(&signable_data);
+    let mut corrupted_sig = signature.to_bytes().to_vec();
+    
+    // 3. 【关键步骤】破坏签名数据
+    // 我们反转签名的最后一个字节。
+    // 这模拟了：篡改数据、伪造密钥、或中间人攻击。
+    if let Some(last) = corrupted_sig.last_mut() {
+        *last ^= 0xFF; 
     }
+
+    // 4. 发送带有“坏签名”的包
+    let packet = ZeroPacket {
+        sender_id: local_id,
+        nonce,
+        signature: corrupted_sig, // <--- 无效的签名
+        payload,
+    };
+    
+    let _ = transport.send(&packet, target).await;
+    println!("[ATTACK] Sent corrupted packet to {}", target);
+}
+
+fn parse_color(hex: &str) -> Result<egui::Color32, ()> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() == 6 {
+        let r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| ())?;
+        let g = u8::from_str_radix(&hex[2..4], 16).map_err(|_| ())?;
+        let b = u8::from_str_radix(&hex[4..6], 16).map_err(|_| ())?;
+        Ok(egui::Color32::from_rgb(r, g, b))
+    } else {
+        Err(())
+    }
+}
+
+fn main() -> Result<(), eframe::Error> {
+    env_logger::init();
+    let port = 8000 + (rand::random::<u16>() % 1000);
+    let (tx_net, rx_net) = std::sync::mpsc::channel::<NetEvent>();
+    let (tx_gui, rx_gui) = mpsc::channel::<GuiCommand>(32);
+
+    thread::spawn(move || {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(run_network_layer(port, tx_net, rx_gui));
+    });
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([500.0, 750.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Project Zero: Secure Node (With Intruder Mode)",
+        options,
+        Box::new(move |cc| Ok(Box::new(ZeroApp::new(cc, rx_net, tx_gui, port)))),
+    )
 }

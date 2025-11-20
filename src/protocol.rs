@@ -1,38 +1,44 @@
+// src/protocol.rs
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use crate::zeroui::Blueprint;
 
 pub type NodeId = [u8; 32];
+// FIX: 使用 Vec<u8> 替代 [u8; 64] 以避免 serde 序列化错误
+pub type SignatureBytes = Vec<u8>; 
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct PeerInfo {
+    pub id: NodeId,
+    pub addr: SocketAddr,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ZeroPacket {
-    pub payload: Vec<u8>,
+    pub sender_id: NodeId,
+    pub nonce: u64,
+    pub signature: SignatureBytes, 
+    pub payload: Payload,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SecureEnvelope {
-    pub nonce: [u8; 12],
-    pub ciphertext: Vec<u8>,
-    pub sender_pubkey: [u8; 32],
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum Signal {
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum Payload {
     Ping,
     Pong,
-    
-    // DHT 路由
     FindNode(NodeId), 
-    Neighbors(Vec<(NodeId, SocketAddr)>), 
+    Neighbors(Vec<PeerInfo>),
+    UiBlueprint(Blueprint),
+    UiAction {
+        action_type: String,
+        payload: String,
+    }
+}
 
-    // DHT 存储
-    Store(NodeId, String),
-    FindValue(NodeId),
-    Value(NodeId, String),
-
-    // Phase 7: NAT 穿透
-    // Bootnode 命令接收者(Target)主动向 requester_addr 发送 Ping
-    Punch(NodeId, SocketAddr), // (Requester_ID, Requester_IP)
-
-    // 聊天
-    Message(String),
+impl ZeroPacket {
+    pub fn get_signable_bytes(nonce: u64, payload: &Payload) -> Vec<u8> {
+        let mut bytes = nonce.to_le_bytes().to_vec();
+        let payload_bytes = serde_json::to_vec(payload).unwrap_or_default();
+        bytes.extend(payload_bytes);
+        bytes
+    }
 }

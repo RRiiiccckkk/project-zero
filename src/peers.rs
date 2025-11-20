@@ -1,17 +1,12 @@
+// src/peers.rs
 use std::net::SocketAddr;
-use crate::protocol::NodeId;
+use crate::protocol::{NodeId, PeerInfo};
 
 pub const K_BUCKET_SIZE: usize = 20;
 const BUCKET_COUNT: usize = 256; 
 
-#[derive(Debug, Clone, Copy)]
-pub struct PeerInfo {
-    pub id: NodeId,
-    pub addr: SocketAddr,
-}
-
 pub struct RoutingTable {
-    local_id: NodeId,
+    pub local_id: NodeId,
     buckets: Vec<Vec<PeerInfo>>,
 }
 
@@ -29,8 +24,7 @@ impl RoutingTable {
 
     fn distance_bucket_index(&self, other: &NodeId) -> usize {
         let mut distinct_bits = 0;
-        // FIXED: 使用 _i 忽略未使用变量
-        for (_i, (a, b)) in self.local_id.iter().zip(other.iter()).enumerate() {
+        for (a, b) in self.local_id.iter().zip(other.iter()) {
             let xor = a ^ b;
             if xor == 0 {
                 distinct_bits += 8;
@@ -50,7 +44,7 @@ impl RoutingTable {
 
         if let Some(pos) = bucket.iter().position(|p| p.id == id) {
             let mut peer = bucket.remove(pos);
-            peer.addr = addr;
+            peer.addr = addr; // 更新地址
             bucket.push(peer);
         } else {
             if bucket.len() < K_BUCKET_SIZE {
@@ -59,40 +53,12 @@ impl RoutingTable {
         }
     }
 
-    pub fn closest_nodes(&self, target: &NodeId) -> Vec<(NodeId, SocketAddr)> {
-        let mut all_peers = Vec::new();
-        for bucket in &self.buckets {
-            for peer in bucket {
-                all_peers.push(*peer);
-            }
-        }
-
-        all_peers.sort_by(|a, b| {
-            let dist_a = xor_distance(&a.id, target);
-            let dist_b = xor_distance(&b.id, target);
-            dist_a.cmp(&dist_b)
-        });
-
-        all_peers.into_iter()
-            .take(K_BUCKET_SIZE)
-            .map(|p| (p.id, p.addr))
-            .collect()
+    /// 获取最近的节点（简化版：返回所有已知节点用于广播）
+    pub fn known_peers(&self) -> Vec<PeerInfo> {
+        self.buckets.iter().flat_map(|b| b.clone()).collect()
     }
-
-    pub fn get_addr(&self, id: &NodeId) -> Option<SocketAddr> {
-        let idx = self.distance_bucket_index(id);
-        self.buckets[idx].iter().find(|p| p.id == *id).map(|p| p.addr)
+    
+    pub fn count(&self) -> usize {
+        self.buckets.iter().map(|b| b.len()).sum()
     }
-
-    pub fn list_all(&self) -> Vec<(NodeId, SocketAddr)> {
-        self.buckets.iter().flat_map(|b| b.clone()).map(|p| (p.id, p.addr)).collect()
-    }
-}
-
-fn xor_distance(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut res = [0u8; 32];
-    for i in 0..32 {
-        res[i] = a[i] ^ b[i];
-    }
-    res
 }
