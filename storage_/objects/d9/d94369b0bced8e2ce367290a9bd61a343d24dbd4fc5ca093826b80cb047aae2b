@@ -1,0 +1,24 @@
+{
+  "type": "VStack",
+  "spacing": 15.0,
+  "children": [
+    { "type": "Text", "value": "The Omega Test", "size": 40.0 },
+    { "type": "Text", "value": "Verifying Fragmentation, Logic & State", "size": 16.0 },
+    
+    { "type": "Image", "src": "950d2dd5bf51b6fbbbded1530d508c56dcb79141030d803d4614c427382be6df", "width": 400.0 },
+    
+    { "type": "HStack", "spacing": 20.0, "children": [
+        { "type": "VStack", "spacing": 5.0, "children": [
+            { "type": "Text", "value": "Visitor Count", "size": 14.0 },
+            { "type": "Text", "value": "$visitors", "size": 30.0 }
+        ]},
+        { "type": "Button", "label": "Check In (+1)", "on_click": { "type": "Increment", "key": "visitors" } }
+    ]},
+    
+    { "type": "HStack", "spacing": 20.0, "children": [
+        { "type": "Text", "value": "System Status:", "size": 18.0 },
+        { "type": "Text", "value": "$status", "size": 18.0 },
+        { "type": "Button", "label": "Toggle Power", "on_click": { "type": "Toggle", "key": "status" } }
+    ]}
+  ]
+}

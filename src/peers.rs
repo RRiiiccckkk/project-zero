@@ -1,64 +1,45 @@
-// src/peers.rs
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use crate::protocol::{NodeId, PeerInfo};
+use crate::protocol::PeerId;
 
-pub const K_BUCKET_SIZE: usize = 20;
-const BUCKET_COUNT: usize = 256; 
-
-pub struct RoutingTable {
-    pub local_id: NodeId,
-    buckets: Vec<Vec<PeerInfo>>,
+/// PeerManager: 简单的内存路由表
+/// 记录 PeerId -> SocketAddr 的映射
+#[derive(Debug)]
+pub struct PeerManager {
+    // 记录 ID 到 地址的映射
+    peers: HashMap<PeerId, SocketAddr>,
+    // 记录我们尝试连接过的地址 (去重用)
+    known_addrs: HashSet<SocketAddr>,
 }
 
-impl RoutingTable {
-    pub fn new(local_id: NodeId) -> Self {
-        let mut buckets = Vec::with_capacity(BUCKET_COUNT);
-        for _ in 0..BUCKET_COUNT {
-            buckets.push(Vec::new());
-        }
+impl PeerManager {
+    pub fn new() -> Self {
         Self {
-            local_id,
-            buckets,
+            peers: HashMap::new(),
+            known_addrs: HashSet::new(),
         }
     }
 
-    fn distance_bucket_index(&self, other: &NodeId) -> usize {
-        let mut distinct_bits = 0;
-        for (a, b) in self.local_id.iter().zip(other.iter()) {
-            let xor = a ^ b;
-            if xor == 0 {
-                distinct_bits += 8;
-            } else {
-                distinct_bits += xor.leading_zeros() as usize;
-                break;
+    /// 添加或更新节点信息
+    pub fn add_peer(&mut self, id: PeerId, addr: SocketAddr) {
+        // 如果是新节点或地址变更，记录日志
+        if let Some(old_addr) = self.peers.insert(id.clone(), addr) {
+            if old_addr != addr {
+                log::info!("Peer {} moved: {} -> {}", id.short(), old_addr, addr);
             }
-        }
-        if distinct_bits >= 255 { 255 } else { distinct_bits }
-    }
-
-    pub fn update(&mut self, id: NodeId, addr: SocketAddr) {
-        if id == self.local_id { return; } 
-
-        let idx = self.distance_bucket_index(&id);
-        let bucket = &mut self.buckets[idx];
-
-        if let Some(pos) = bucket.iter().position(|p| p.id == id) {
-            let mut peer = bucket.remove(pos);
-            peer.addr = addr; // 更新地址
-            bucket.push(peer);
         } else {
-            if bucket.len() < K_BUCKET_SIZE {
-                bucket.push(PeerInfo { id, addr });
-            }
+            log::info!("New Peer Discovered: {} at {}", id.short(), addr);
         }
+        self.known_addrs.insert(addr);
     }
 
-    /// 获取最近的节点（简化版：返回所有已知节点用于广播）
-    pub fn known_peers(&self) -> Vec<PeerInfo> {
-        self.buckets.iter().flat_map(|b| b.clone()).collect()
+    /// 添加一个引导节点地址 (尚未知晓 ID)
+    pub fn add_bootstrap_addr(&mut self, addr: SocketAddr) {
+        self.known_addrs.insert(addr);
     }
-    
-    pub fn count(&self) -> usize {
-        self.buckets.iter().map(|b| b.len()).sum()
+
+    /// 获取所有已知节点的地址 (用于广播)
+    pub fn get_all_addrs(&self) -> Vec<SocketAddr> {
+        self.known_addrs.iter().cloned().collect()
     }
 }

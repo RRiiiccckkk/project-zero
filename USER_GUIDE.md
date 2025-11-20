@@ -1,140 +1,175 @@
 ```markdown
-# Project Zero v0.3 User Guide / 用户使用手册
+这是基于 **Phase 20** 完成后的最新版用户手册。它涵盖了从存储分片、大文件传输、到交互式 UI 和自我修复机制的所有新特性。
 
-**Version:** 0.3 (Secure Gossip Release)
-**Architecture:** ZeroUI + UDP + Ed25519 + DHT
+--- START OF FILE USER_GUIDE.md ---
+
+```markdown
+# Project Zero v0.4 User Guide / 用户使用手册
+
+**Version:** 0.4 Alpha (The "ZeroNet" Release)
+**Architecture:** ZeroStore + ZeroUI + UDP Fragmentation + Declarative State
 
 ---
 
 ## 📖 目录 (Table of Contents)
-1.  [快速启动 (Quick Start)](#1-快速启动-quick-start)
-2.  [通用界面指南 (General Interface)](#2-通用界面指南-general-interface)
-3.  [开发者高级指南 (Developer's Guide)](#3-开发者高级指南-developers-guide)
-    *   [构建网络拓扑 (Network Topology)](#31-构建网络拓扑)
-    *   [Gossip 广播机制验证](#32-gossip-广播机制验证)
-    *   [入侵与防御测试 (Security Audit)](#33-入侵与防御测试-security-audit)
-4.  [故障排查 (Troubleshooting)](#4-故障排查-troubleshooting)
+1.  [项目概述 (Overview)](#1-项目概述-overview)
+2.  [快速启动 (Quick Start)](#2-快速启动-quick-start)
+3.  [界面概览 (Interface Overview)](#3-界面概览-interface-overview)
+4.  [创作者指南 (Creator's Guide)](#4-创作者指南-creators-guide)
+    *   [上传多媒体资源 (Assets)](#41-上传多媒体资源-assets)
+    *   [编写交互式蓝图 (Blueprints)](#42-编写交互式蓝图-blueprints)
+    *   [蓝图语法参考 (Syntax Cheat Sheet)](#43-蓝图语法参考-syntax-cheat-sheet)
+5.  [浏览与交互 (Browsing & Interactivity)](#5-浏览与交互-browsing--interactivity)
+6.  [高级特性与安全 (Advanced & Security)](#6-高级特性与安全-advanced--security)
+    *   [UDP 分片传输 (Fragmentation)](#61-udp-分片传输-fragmentation)
+    *   [自我修复机制 (Self-Healing)](#62-自我修复机制-self-healing)
+    *   [存储结构 (Storage Layout)](#63-存储结构-storage-layout)
 
 ---
 
-## 1. 快速启动 (Quick Start)
+## 1. 项目概述 (Overview)
+Project Zero v0.4 是一个完全去中心化的互联网基础设施原型。它移除了 HTTP、TCP、DNS 和 Web 服务器，实现了：
+*   **内容寻址 (Content Addressing)**: 通过 CID (Hash) 访问数据。
+*   **原生渲染 (Native Rendering)**: 传输 JSON 蓝图，由客户端直接 GPU 渲染，无 HTML/CSS。
+*   **无代码交互 (No-Code Logic)**: 安全的声明式状态机，杜绝脚本注入攻击。
+*   **抗毁性 (Resilience)**: 数据篡改自动检测与网络自我修复。
 
-Project Zero v0.3 是一个独立的 P2P 节点程序。要模拟去中心化网络，你需要同时运行多个实例。
+---
 
-### 启动节点
-打开终端，运行以下命令：
+## 2. 快速启动 (Quick Start)
+
+为了模拟 P2P 网络，建议在同一台机器上启动两个不同的节点（终端窗口）。
+
+### 启动节点 A (发布者/Creator)
 ```bash
-cargo run
+# 端口 9000，存储目录 ./storage_a
+cargo run -- 9000 ./storage_a
 ```
-*建议：打开 2~3 个独立的终端窗口，分别运行该命令，以模拟不同的网络节点。*
+
+### 启动节点 B (浏览者/Consumer)
+```bash
+# 端口 9001，存储目录 ./storage_b，连接到节点 A
+cargo run -- 9001 ./storage_b 127.0.0.1:9000
+```
 
 ---
 
-## 2. 通用界面指南 (General Interface)
+## 3. 界面概览 (Interface Overview)
 
-启动后，你将看到 **ZeroUI** 图形界面。
+v0.4 采用了 **双栏布局 (Split View)**：
 
-### 2.1 顶部控制栏 (Top Control Bar)
-这是节点的控制中枢，从左到右依次为：
-
-*   **🔌 Peers (节点数)**:
-    显示当前节点路由表中已连接的邻居数量。初始为 0。
-*   **🔒 Verified (安全状态)**:
-    显示当前主视图内容的来源签名。
-    *   `System (Local)`: 显示的是本地默认内容。
-    *   `<Hex_Key>` (绿色): 显示的是来自远程节点的、签名验证通过的安全内容。
-*   **Bootstrap IP (引导入口)**:
-    *   用于输入你想连接的第一个节点的地址（例如 `127.0.0.1:8000`）。
-    *   点击 **[Join]** 按钮进行连接。
-*   **📡 Broadcast (广播按钮)**:
-    *   点击后，将把自己当前的 UI 蓝图签名并广播给所有已知节点。
-
-### 2.2 主视图 (Main View)
-屏幕中央的白色/灰色区域是 **"投影区"**。
-*   **特性**: 这里不包含任何本地硬编码逻辑。它完全由接收到的 JSON 数据包驱动渲染。
-*   **交互**: 如果远程蓝图中包含按钮（如 Ping），点击它会发送回执信号。
-
-### 2.3 底部日志面板 (System Logs)
-位于窗口最底部。
-*   这是了解节点底层行为的窗口。
-*   它会显示：数据包接收、握手状态、签名验证结果、Gossip 转发记录等。
+*   **左侧: Creator Studio (创作者工作室)**
+    *   用于上传图片、编写 JSON 代码、发布页面。
+    *   包含 "Upload Image" 和 "Publish App Blueprint" 按钮。
+*   **右侧: Projector / Browser (投影仪/浏览器)**
+    *   用于输入 CID 并渲染远程内容。
+    *   包含 CID 输入框、"Fetch" 按钮和渲染画布。
+*   **底部: System Logs (系统日志)**
+    *   显示传输进度、分片重组状态、安全警告等。
+*   **顶部: Status Bar (状态栏)**
+    *   显示当前节点 ID 和最近一次操作的反馈（如 "Asset Uploaded!"）。
 
 ---
 
-## 3. 开发者高级指南 (Developer's Guide)
+## 4. 创作者指南 (Creator's Guide)
 
-本章节适用于理解协议流、调试网络以及验证安全性的开发者。
+### 4.1 上传多媒体资源 (Assets)
+ZeroUI 支持显示图片，甚至是大尺寸图片（支持自动分片）。
 
-### 3.1 构建网络拓扑
-为了测试 Gossip 协议，你需要构建一个链式或网状结构。
+1.  在左侧点击 **📂 Upload Image**。
+2.  选择本地的 `.png` 或 `.jpg` 文件。
+3.  观察日志，等待上传完成（大文件会显示 `Fragmenting...`）。
+4.  成功后，点击出现的 **📋 Asset CID** 按钮复制哈希值。
 
-**场景：构建 A -> B -> C 链路**
+### 4.2 编写交互式蓝图 (Blueprints)
+Project Zero 不使用 HTML，而是使用 JSON 描述 UI。
 
-1.  **获取端口**: 启动三个节点，查看各自底部日志的第一行：
-    *   节点 A: `Secure Node started on port 8000`
-    *   节点 B: `Secure Node started on port 8001`
-    *   节点 C: `Secure Node started on port 8002`
-2.  **连接 B 到 A**:
-    *   在节点 B 的 `Bootstrap IP` 输入 `127.0.0.1:8000`，点击 **[Join]**。
-    *   *检查*: B 的 Peers 变为 1，A 的 Peers 变为 1。
-3.  **连接 C 到 B**:
-    *   在节点 C 的 `Bootstrap IP` 输入 `127.0.0.1:8001`，点击 **[Join]**。
-    *   *检查*: C 的 Peers 变为 1 (连了 B)，B 的 Peers 变为 2 (连了 A 和 C)。
+1.  在左侧编辑框编写 JSON。
+2.  若要引用刚才上传的图片，将 `src` 字段的值替换为刚才复制的 Asset CID。
+3.  点击 **🚀 Publish App Blueprint**。
+4.  成功后，点击 **📋 Page CID** 获取该页面的访问地址。
 
-### 3.2 Gossip 广播机制验证
-验证消息是否能通过中间节点转发。
+### 4.3 蓝图语法参考 (Syntax Cheat Sheet)
 
-1.  在 **节点 A** 上点击 **[📡 Broadcast]**。
-2.  **观察节点 C**:
-    *   虽然 C 没有直接连接 A，但 C 的界面应瞬间变为 A 的金色欢迎界面。
-    *   顶部状态栏应显示：`🔒 Verified: <NodeA_PublicKey>`。
-3.  **观察节点 B (中继者)**:
-    *   检查 B 的底部日志，应包含：`>> Relayed to 1 peers.`
-    *   *原理解析*: B 收到 A 的包，验证签名通过，查表发现 C，遂将包转发给 C。
+**基础组件:**
+```json
+{ "type": "VStack", "spacing": 10.0, "children": [...] }  // 垂直布局
+{ "type": "HStack", "spacing": 10.0, "children": [...] }  // 水平布局
+{ "type": "Text", "value": "Hello", "size": 20.0 }        // 文本
+{ "type": "Image", "src": "<CID>", "width": 300.0 }       // 图片
+```
 
-### 3.3 入侵与防御测试 (Security Audit)
-v0.3 内置了 **Intruder Mode (入侵模式)**，用于验证 Ed25519 签名拦截机制。
+**交互组件 (按钮与链接):**
+```json
+// 页面跳转
+{ 
+  "type": "Button", 
+  "label": "Go to Page 2", 
+  "on_click": { "type": "Navigate", "cid": "<Target_CID>" } 
+}
+```
 
-#### 第一步：确定攻击目标
-假设 **节点 A** 想攻击 **节点 B**。
-*   首先，你需要知道 **节点 B** 的确切监听端口（查看节点 B 的窗口标题或首行日志，例如 `8001`）。
+**状态绑定 (State & Logic):**
+*   **显示变量**: 在 Text value 中使用 `$` 前缀，如 `"$counter"`。
+*   **修改变量**: 使用 `Increment` (自增) 或 `Toggle` (切换 0/1)。
 
-#### 第二步：配置攻击向量
-在 **节点 A** 的界面顶部，最右侧：
-1.  找到红色的 **[😈 Attack]** 按钮。
-2.  **关键步骤**: 在红色按钮**左侧的小输入框**中，输入受害者地址：
-    `127.0.0.1:8001`
-    *(注意：不要输错成 Bootstrap 的输入框，也不要输错端口)*
+```json
+// 显示状态
+{ "type": "Text", "value": "Count: $counter", "size": 20.0 }
 
-#### 第三步：发动攻击与取证
-1.  点击 **[😈 Attack]**。
-2.  **攻击者 (A) 日志**:
-    `🚀 Launching SPOOFED packet...` (发送了签名最后一字节被反转的恶意包)。
-3.  **受害者 (B) 取证**:
-    *   **界面表现**: 界面**必须**保持原样，不能出现红色的 "HACKED" 警告。
-    *   **日志取证**: 底部日志**必须**出现以下红字警告：
-        ```text
-        🛡️ BLOCKED: Fake/Tampered packet from 127.0.0.1:XXXX
-        ```
+// 触发逻辑
+{ 
+  "type": "Button", 
+  "label": "+1", 
+  "on_click": { "type": "Increment", "key": "counter" } 
+}
+```
 
 ---
 
-## 4. 故障排查 (Troubleshooting)
+## 5. 浏览与交互 (Browsing & Interactivity)
 
-**Q: 为什么点击 Attack 后，受害者的日志没有任何反应？**
-*   **A**: 你可能攻击了错误的端口（例如打到了空端口）。请务必检查受害者窗口第一行日志 `Started on port XXXX`，并确保攻击者输入框里的地址与之一致。
+在右侧的 **Projector** 面板：
 
-**Q: 为什么我看不到 "Relayed" 日志？**
-*   **A**: 只有**中间节点**会打印 Relayed。
-    *   A -> B: 没人转发。
-    *   A -> B -> C: A 广播，B 会打印 Relayed（转发给 C）。
-
-**Q: 为什么广播一次后，再点广播没有反应？**
-*   **A**: 系统内置了**去重缓存 (Deduplication)**。如果你短时间内发送完全相同的包（Nonce 相同），接收方会视为重复包直接丢弃。v0.3 的广播按钮每次点击都会生成新的随机 Nonce，所以通常都会刷新。
-
-**Q: 这个系统真的没有 Web 服务器吗？**
-*   **A**: 是的。没有 Nginx，没有 Apache，没有 HTML。你看到的每一个像素都是由 Rust 代码解析 UDP 数据包后直接绘制在 GPU 上的。
+1.  **访问**: 在地址栏输入 CID（或从左侧复制 Page CID），点击 **Fetch**。
+2.  **加载**:
+    *   如果是纯文本页面，瞬间显示。
+    *   如果是富媒体页面，你会看到日志滚动 `Req Resource...`，图片随后自动加载。
+    *   如果是大文件，你会看到 `Received Chunk X/100`，随后 `Reassembly Complete`。
+3.  **交互**:
+    *   点击按钮体验无代码逻辑（如计数器增加、开关切换）。
+    *   这些状态仅存在于当前会话内存中，重启节点会重置。
 
 ---
 
-> **Project Zero** - *Rebuilding the Internet, one packet at a time.*
+## 6. 高级特性与安全 (Advanced & Security)
+
+### 6.1 UDP 分片传输 (Fragmentation)
+Project Zero 突破了 UDP 的 MTU 限制（通常 <1500 字节）。
+*   **机制**: 大文件会被自动切割成 4KB 的小块 (Chunks)。
+*   **现象**: 当传输大图时，日志会显示大量的分片接收记录。
+*   **可靠性**: 接收端包含重组缓冲区 (Assembler)，只有收齐所有碎片才会还原文件。
+
+### 6.2 自我修复机制 (Self-Healing)
+系统假设磁盘是不可信的。
+*   **完整性校验**: 每次从磁盘读取文件（Fetch）时，系统都会重新计算哈希。
+*   **篡改测试**:
+    1.  关闭 Node A。
+    2.  手动修改 Node B `./storage_b/objects/` 下的某个图片文件（破坏其内容）。
+    3.  启动 Node B 并 Fetch 该页面。
+    4.  **结果**: 界面显示红色警告 `⚠️ SECURITY ALERT: Data Corruption`，并拒绝显示坏图。
+    5.  **修复**: 启动 Node A，Node B 会自动向 A 请求正确的数据副本，并覆盖坏文件，图片恢复显示。
+
+### 6.3 存储结构 (Storage Layout)
+为了优化性能，ZeroStore 采用了前缀分片策略：
+
+*   **物理层 (`/objects/`)**:
+    *   路径: `./storage_x/objects/ab/abcdef123...`
+    *   说明: 文件名即哈希。前两位字符 (`ab`) 为子目录，防止单目录文件过多。
+*   **逻辑层 (`manifest.log`)**:
+    *   说明: 人类可读的日志文件，记录了何时(`Time`)、以何种操作(`NEW/DUP`)、存入了哪个 CID。
+
+---
+
+> **Project Zero** - *Trust Math, Not Servers.*
+```

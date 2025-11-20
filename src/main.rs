@@ -1,451 +1,452 @@
-// src/main.rs
-// Phase 13: Intruder Simulation & Security Verification
-
 mod protocol;
-mod transport; 
-mod peers;     
+mod transport;
+mod peers;
 mod zeroui;
+mod storage;
 
-use eframe::egui;
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use anyhow::Result;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use tokio::runtime::Runtime;
+use std::collections::{HashSet, HashMap};
+use std::env;
+use std::net::SocketAddr;
 use tokio::sync::mpsc;
-
-use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey, Signature};
+use eframe::egui;
+use log::{info, error, debug};
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use uuid::Uuid;
 
-use protocol::{ZeroPacket, Payload};
-use transport::UdpTransport;
-use peers::RoutingTable;
-use zeroui::{Blueprint, Widget, Direction};
+use protocol::{ZeroPacket, Payload, PeerId};
+use transport::Transport;
+use peers::PeerManager;
+use storage::ZeroStore;
+use zeroui::{Component, Action, RenderContext, StateMutation};
 
-enum NetEvent {
+const CHUNK_SIZE: usize = 4096; 
+
+// --- Assembler State ---
+struct Assembler {
+    buffers: HashMap<String, (u32, u32, HashMap<u32, Vec<u8>>)>,
+}
+
+impl Assembler {
+    fn new() -> Self { Self { buffers: HashMap::new() } }
+    fn add_chunk(&mut self, group_id: String, index: u32, total: u32, data: Vec<u8>) -> Option<Vec<u8>> {
+        let entry = self.buffers.entry(group_id.clone()).or_insert((0, total, HashMap::new()));
+        if entry.2.contains_key(&index) { return None; }
+        entry.2.insert(index, data);
+        entry.0 += 1;
+        if entry.0 == total {
+            let mut full_data = Vec::new();
+            for i in 0..total {
+                if let Some(chunk_data) = entry.2.get(&i) { full_data.extend_from_slice(chunk_data); } 
+                else { return None; }
+            }
+            self.buffers.remove(&group_id);
+            return Some(full_data);
+        }
+        None
+    }
+}
+
+// --- CLI Configuration ---
+struct Config {
+    port: u16,
+    storage_path: String,
+    bootstrap_peer: Option<SocketAddr>,
+}
+
+impl Config {
+    fn parse() -> Self {
+        let args: Vec<String> = env::args().collect();
+        let port = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(9000);
+        let storage_path = args.get(2).cloned().unwrap_or_else(|| "./storage".to_string());
+        let bootstrap_peer = args.get(3).and_then(|s| s.parse().ok());
+        Self { port, storage_path, bootstrap_peer }
+    }
+}
+
+#[derive(Debug)]
+pub enum Command {
+    Publish { content: Vec<u8> },
+    Fetch { cid: String },
+}
+
+#[derive(Debug)]
+pub enum GuiEvent {
     Log(String),
-    NewBlueprint(Blueprint, String), 
-    PeerUpdate(usize),
+    Error(String),
+    ContentArrived { cid: String, data: Vec<u8> },
+    PublishSuccess { cid: String, is_json: bool },
 }
 
-enum GuiCommand {
-    Bootstrap { target_addr: SocketAddr },
-    BroadcastUI,
-    // 新增：攻击指令
-    Attack { target_addr: SocketAddr },
-    SendAction { op: String, param: String },
-}
-
-struct ZeroApp {
-    blueprint: Blueprint,
-    verified_source: String,
-    input_state: HashMap<String, String>,
-    logs: Vec<String>,
-    peer_count: usize,
-    rx_net: std::sync::mpsc::Receiver<NetEvent>,
-    tx_gui: mpsc::Sender<GuiCommand>,
-}
-
-impl ZeroApp {
-    fn new(
-        cc: &eframe::CreationContext, 
-        rx_net: std::sync::mpsc::Receiver<NetEvent>,
-        tx_gui: mpsc::Sender<GuiCommand>,
-        local_port: u16
-    ) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        Self {
-            blueprint: zeroui::splash_screen(local_port),
-            verified_source: "System (Local)".into(),
-            input_state: HashMap::new(),
-            logs: vec![format!("Secure Node started on port {}.", local_port)],
-            peer_count: 0,
-            rx_net,
-            tx_gui,
-        }
-    }
-
-    fn render_widget(&mut self, ui: &mut egui::Ui, widget: &Widget) {
-        match widget {
-            Widget::Container { direction, children, padding, spacing } => {
-                let layout = match direction {
-                    Direction::Horizontal => egui::Layout::left_to_right(egui::Align::Center),
-                    Direction::Vertical => egui::Layout::top_down(egui::Align::Min),
-                };
-                egui::Frame::none().inner_margin(padding.unwrap_or(0.0)).show(ui, |ui| {
-                    ui.with_layout(layout, |ui| {
-                        if let Some(s) = spacing { ui.spacing_mut().item_spacing = egui::vec2(*s, *s); }
-                        for child in children { self.render_widget(ui, child); }
-                    });
-                });
-            }
-            Widget::Text { content, size, color } => {
-                let mut txt = egui::RichText::new(content);
-                if let Some(s) = size { txt = txt.size(*s); }
-                if let Some(c) = color { if let Ok(col) = parse_color(c) { txt = txt.color(col); } }
-                ui.label(txt);
-            }
-            Widget::Input { id, placeholder } => {
-                let val = self.input_state.entry(id.clone()).or_insert(String::new());
-                ui.add(egui::TextEdit::singleline(val).hint_text(placeholder));
-            }
-            Widget::Button { label, action_op, action_param } => {
-                if ui.button(label).clicked() {
-                    let val = self.input_state.get(action_param).cloned().unwrap_or(action_param.clone());
-                    let _ = self.tx_gui.try_send(GuiCommand::SendAction {
-                        op: action_op.clone(),
-                        param: val,
-                    });
-                }
-            }
-        }
-    }
-}
-
-impl eframe::App for ZeroApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(event) = self.rx_net.try_recv() {
-            match event {
-                NetEvent::Log(msg) => self.logs.push(msg),
-                NetEvent::NewBlueprint(bp, source) => {
-                    self.blueprint = bp;
-                    self.verified_source = source;
-                },
-                NetEvent::PeerUpdate(count) => self.peer_count = count,
-            }
-        }
-
-        egui::TopBottomPanel::top("net_controls").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("🔌 Peers: {}", self.peer_count));
-                
-                // 正常的 Bootstrap
-                let boot_val = self.input_state.entry("bootstrap_ip".into()).or_insert("127.0.0.1:8000".into());
-                ui.add(egui::TextEdit::singleline(boot_val).desired_width(100.0).hint_text("IP"));
-                if ui.button("Join").clicked() {
-                    if let Ok(addr) = boot_val.parse::<SocketAddr>() {
-                        let _ = self.tx_gui.try_send(GuiCommand::Bootstrap { target_addr: addr });
-                    }
-                }
-                
-                ui.separator();
-                
-                // 广播
-                if ui.button("📡 Broadcast").clicked() {
-                    let _ = self.tx_gui.try_send(GuiCommand::BroadcastUI);
-                    self.logs.push("Broadcasting verified UI...".into());
-                }
-
-                ui.separator();
-
-                // --- INTRUDER CONTROLS ---
-                // 攻击特定 IP
-                let attack_val = self.input_state.entry("attack_ip".into()).or_insert("127.0.0.1:8000".into());
-                ui.add(egui::TextEdit::singleline(attack_val).desired_width(100.0).hint_text("Target IP"));
-                
-                // 红色按钮：模拟攻击
-                if ui.add(egui::Button::new("😈 Attack").fill(egui::Color32::from_rgb(200, 50, 50))).clicked() {
-                    if let Ok(addr) = attack_val.parse::<SocketAddr>() {
-                        let _ = self.tx_gui.try_send(GuiCommand::Attack { target_addr: addr });
-                        self.logs.push(format!("🚀 Launching SPOOFED packet to {}...", addr));
-                    }
-                }
-            });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                // 显示当前验证状态
-                ui.horizontal(|ui| {
-                    ui.label("Current View Source:");
-                    ui.colored_label(egui::Color32::GREEN, &self.verified_source);
-                });
-                ui.separator();
-                
-                let root = self.blueprint.root.clone();
-                self.render_widget(ui, &root);
-            });
-        });
-
-        egui::TopBottomPanel::bottom("logs").max_height(150.0).show(ctx, |ui| {
-            ui.separator();
-            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                for log in &self.logs {
-                    ui.monospace(log);
-                }
-            });
-        });
-        
-        ctx.request_repaint();
-    }
-}
-
-async fn run_network_layer(
-    local_port: u16,
-    tx_net: std::sync::mpsc::Sender<NetEvent>,
-    mut rx_gui: mpsc::Receiver<GuiCommand>
-) {
-    let addr = SocketAddr::from(([0, 0, 0, 0], local_port));
-    println!("\n=== SECURE ZERONET NODE ON PORT {} ===\n", local_port);
-
-    let transport = match UdpTransport::new(addr).await {
-        Ok(t) => Arc::new(t),
-        Err(e) => { println!("[FATAL] Bind Error: {}", e); return; }
-    };
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let config = Config::parse();
+    info!("Starting Node on Port: {}", config.port);
 
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
-    let local_pubkey = signing_key.verifying_key();
-    let local_id = local_pubkey.to_bytes();
-
-    let routing_table = Arc::new(Mutex::new(RoutingTable::new(local_id)));
+    let my_id = PeerId::from_public_key(&signing_key.verifying_key());
     
-    let short_id = hex::encode(&local_id[0..4]);
-    let _ = tx_net.send(NetEvent::Log(format!("Identity: {}... (Ed25519)", short_id)));
+    let store = Arc::new(ZeroStore::new(&config.storage_path).await?);
+    let transport = Transport::bind(config.port).await.unwrap_or_else(|e| panic!("{}", e));
+    let peers = Arc::new(Mutex::new(PeerManager::new()));
+    if let Some(addr) = config.bootstrap_peer { peers.lock().unwrap().add_bootstrap_addr(addr); }
 
-    let mut seen_packets: Vec<([u8;32], u64)> = Vec::new();
+    let (tx_cmd, mut rx_cmd) = mpsc::channel::<Command>(100);
+    let (tx_event, rx_event) = mpsc::channel::<GuiEvent>(100);
 
-    let my_dashboard = Blueprint {
-        title: format!("Secure Space: {}", short_id),
-        root: Widget::Container {
-            direction: Direction::Vertical,
-            padding: Some(20.0),
-            spacing: Some(10.0),
-            children: vec![
-                Widget::Text { 
-                    content: format!("Identity: Node {}", short_id), 
-                    size: Some(24.0), 
-                    color: Some("#00FF88".into()) 
-                },
-                Widget::Text { 
-                    content: "This content is trusted.".into(), 
-                    size: None, color: None 
-                },
-                Widget::Button { label: "Ping".into(), action_op: "ping".into(), action_param: "".into() }
-            ]
+    // Network Reactor
+    let net_key = signing_key.clone();
+    let net_store = store.clone();
+    let net_peers = peers.clone();
+    let tx_event_net = tx_event.clone();
+
+    tokio::spawn(async move {
+        let mut seen_packets = HashSet::new();
+        let mut assembler = Assembler::new(); 
+        if let Some(addr) = config.bootstrap_peer {
+             let _ = transport.send_to(ZeroPacket::new(Payload::Heartbeat { timestamp: 0 }, &net_key), addr).await;
         }
-    };
 
-    loop {
-        tokio::select! {
-            res = transport.recv() => {
-                match res {
-                    Ok((packet, src_addr)) => {
-                        // --- SECURITY LAYER ---
-                        let sender_pubkey = match VerifyingKey::from_bytes(&packet.sender_id) {
-                            Ok(pk) => pk,
-                            Err(_) => { continue; }
-                        };
-
-                        if packet.signature.len() != 64 { continue; }
-                        let mut sig_bytes = [0u8; 64];
-                        sig_bytes.copy_from_slice(&packet.signature);
-                        let signature = Signature::from_bytes(&sig_bytes);
-
-                        let signable_data = ZeroPacket::get_signable_bytes(packet.nonce, &packet.payload);
-                        
-                        // 核心验证逻辑：如果这里失败，直接丢弃
-                        if sender_pubkey.verify(&signable_data, &signature).is_err() {
-                            let _ = tx_net.send(NetEvent::Log(format!("🛡️ BLOCKED: Fake/Tampered packet from {}", src_addr)));
-                            println!("[SEC] BLOCKED ATTACK from {}", src_addr);
-                            continue; // DROP THE PACKET
-                        }
-                        // ----------------------
-
-                        let msg_key = (packet.sender_id, packet.nonce);
-                        if seen_packets.contains(&msg_key) {
-                             match packet.payload {
-                                Payload::Ping | Payload::Pong | Payload::FindNode(_) | Payload::Neighbors(_) => {}, 
-                                _ => continue 
-                            }
-                        } else {
-                            seen_packets.push(msg_key);
-                            if seen_packets.len() > 100 { seen_packets.remove(0); }
-                        }
-
-                        let peer_count = {
-                            let mut rt = routing_table.lock().unwrap();
-                            rt.update(packet.sender_id, src_addr);
-                            rt.count()
-                        };
-                        let _ = tx_net.send(NetEvent::PeerUpdate(peer_count));
-
-                        match packet.payload {
-                            Payload::Ping => {
-                                send_signed_packet(&transport, &signing_key, local_id, packet.nonce, Payload::Pong, src_addr).await;
-                            },
-                            Payload::Pong => {},
-                            Payload::FindNode(_) => {
-                                let peers = routing_table.lock().unwrap().known_peers();
-                                send_signed_packet(&transport, &signing_key, local_id, 0, Payload::Neighbors(peers), src_addr).await;
-                            },
-                            Payload::Neighbors(peers) => {
-                                {
-                                    let mut rt = routing_table.lock().unwrap();
-                                    for p in peers { rt.update(p.id, p.addr); }
+        loop {
+            tokio::select! {
+                Some(cmd) = rx_cmd.recv() => {
+                    match cmd {
+                        Command::Publish { content } => {
+                            let is_json = if let Ok(s) = String::from_utf8(content.clone()) { s.trim().starts_with('{') } else { false };
+                            match net_store.store(&content).await {
+                                Ok(cid) => {
+                                    let _ = tx_event_net.send(GuiEvent::PublishSuccess { cid: cid.clone(), is_json }).await;
+                                    let _ = tx_event_net.send(GuiEvent::Log(format!("Saved: {}...", &cid[0..8]))).await;
+                                    let payload = Payload::Store { cid, data: content };
+                                    smart_broadcast(payload, &net_key, &transport, &net_peers, &mut seen_packets).await;
                                 }
-                                let count = routing_table.lock().unwrap().count();
-                                let _ = tx_net.send(NetEvent::PeerUpdate(count));
-                            },
-                            Payload::UiBlueprint(ref bp) => {
-                                let source_id = hex::encode(&packet.sender_id[0..4]);
-                                let _ = tx_net.send(NetEvent::NewBlueprint(bp.clone(), source_id.clone()));
-                                let _ = tx_net.send(NetEvent::Log(format!("Verified UI from {}", source_id)));
-
-                                let neighbors = routing_table.lock().unwrap().known_peers();
-                                for peer in neighbors {
-                                    if peer.addr != src_addr && peer.id != local_id {
-                                        let _ = transport.send(&packet, peer.addr).await;
+                                Err(e) => { error!("Store failed: {}", e); }
+                            }
+                        }
+                        // --- 核心修改区：Command::Fetch ---
+                        Command::Fetch { cid } => {
+                            // 不再使用 if let Ok... 而是使用 match 捕获具体错误
+                            match net_store.fetch(&cid).await {
+                                Ok(data) => {
+                                    let _ = tx_event_net.send(GuiEvent::ContentArrived { cid, data }).await;
+                                }
+                                Err(e) => {
+                                    // 如果错误信息包含 "corruption"，说明是哈希校验失败
+                                    if e.to_string().to_lowercase().contains("corruption") {
+                                        let _ = tx_event_net.send(GuiEvent::Error(format!("⚠️ SECURITY ALERT: Data Corruption Detected in {}! File quarantined.", &cid[0..8]))).await;
+                                    } else {
+                                        // 只是普通的文件未找到
+                                        // let _ = tx_event_net.send(GuiEvent::Log(format!("Cache Miss: {}", &cid[0..8]))).await;
                                     }
-                                }
-                            },
-                            Payload::UiAction { .. } => {}
-                        }
-                    }
-                    Err(e) => println!("Recv Err: {}", e),
-                }
-            }
-
-            cmd = rx_gui.recv() => {
-                if let Some(command) = cmd {
-                    match command {
-                        GuiCommand::Bootstrap { target_addr } => {
-                            send_signed_packet(&transport, &signing_key, local_id, 0, Payload::FindNode(local_id), target_addr).await;
-                        },
-                        GuiCommand::BroadcastUI => {
-                            let targets = routing_table.lock().unwrap().known_peers();
-                            let nonce = rand::random::<u64>();
-                            seen_packets.push((local_id, nonce));
-                            for peer in &targets {
-                                send_signed_packet(&transport, &signing_key, local_id, nonce, Payload::UiBlueprint(my_dashboard.clone()), peer.addr).await;
-                            }
-                            let _ = tx_net.send(NetEvent::Log(format!("Signed & Broadcasted to {} peers.", targets.len())));
-                        },
-                        // --- INTRUDER LOGIC ---
-                        GuiCommand::Attack { target_addr } => {
-                             send_malicious_packet(&transport, &signing_key, local_id, target_addr).await;
-                        },
-                        // ----------------------
-                        GuiCommand::SendAction { op, param } => {
-                             if op == "connect_ip" {
-                                if let Ok(addr) = param.parse::<SocketAddr>() {
-                                     send_signed_packet(&transport, &signing_key, local_id, 0, Payload::FindNode(local_id), addr).await;
+                                    
+                                    // 无论什么错误，都尝试从网络获取 (Self-Healing)
+                                    let _ = tx_event_net.send(GuiEvent::Log(format!("Fetching Net: {}...", &cid[0..8]))).await;
+                                    let payload = Payload::Fetch { cid };
+                                    smart_broadcast(payload, &net_key, &transport, &net_peers, &mut seen_packets).await;
                                 }
                             }
                         }
+                        // -----------------------------------
                     }
+                }
+                Ok((packet, addr)) = transport.recv() => {
+                    if !packet.verify() { continue; }
+                    if seen_packets.contains(&packet.id) { continue; }
+                    seen_packets.insert(packet.id.clone());
+                    net_peers.lock().unwrap().add_peer(packet.sender.clone(), addr);
+                    process_inbound_payload(packet.payload, &net_key, &transport, &net_peers, &net_store, &tx_event_net, &mut assembler, &mut seen_packets, addr).await;
                 }
             }
         }
-    }
-}
-
-async fn send_signed_packet(
-    transport: &Arc<UdpTransport>,
-    key: &SigningKey,
-    local_id: [u8; 32],
-    nonce: u64,
-    payload: Payload,
-    target: SocketAddr
-) {
-    let signable_data = ZeroPacket::get_signable_bytes(nonce, &payload);
-    let signature: Signature = key.sign(&signable_data);
-    
-    let packet = ZeroPacket {
-        sender_id: local_id,
-        nonce,
-        signature: signature.to_bytes().to_vec(),
-        payload,
-    };
-    let _ = transport.send(&packet, target).await;
-}
-
-// --- THE ATTACK FUNCTION ---
-async fn send_malicious_packet(
-    transport: &Arc<UdpTransport>,
-    key: &SigningKey,
-    local_id: [u8; 32],
-    target: SocketAddr
-) {
-    // 1. 构造一个恶意的 UI Payload
-    let evil_blueprint = Blueprint {
-        title: "HACKED SYSTEM".into(),
-        root: Widget::Container {
-            direction: Direction::Vertical,
-            padding: Some(50.0),
-            spacing: Some(20.0),
-            children: vec![
-                Widget::Text { 
-                    content: "⚠️ YOU HAVE BEEN HACKED ⚠️".into(), 
-                    size: Some(32.0), 
-                    color: Some("#FF0000".into()) 
-                },
-                Widget::Text { 
-                    content: "Your cryptographic layer failed.".into(), 
-                    size: Some(16.0), color: Some("#FFFFFF".into()) 
-                }
-            ]
-        }
-    };
-    
-    let nonce = rand::random::<u64>();
-    let payload = Payload::UiBlueprint(evil_blueprint);
-    
-    // 2. 进行正常签名
-    let signable_data = ZeroPacket::get_signable_bytes(nonce, &payload);
-    let signature: Signature = key.sign(&signable_data);
-    let mut corrupted_sig = signature.to_bytes().to_vec();
-    
-    // 3. 【关键步骤】破坏签名数据
-    // 我们反转签名的最后一个字节。
-    // 这模拟了：篡改数据、伪造密钥、或中间人攻击。
-    if let Some(last) = corrupted_sig.last_mut() {
-        *last ^= 0xFF; 
-    }
-
-    // 4. 发送带有“坏签名”的包
-    let packet = ZeroPacket {
-        sender_id: local_id,
-        nonce,
-        signature: corrupted_sig, // <--- 无效的签名
-        payload,
-    };
-    
-    let _ = transport.send(&packet, target).await;
-    println!("[ATTACK] Sent corrupted packet to {}", target);
-}
-
-fn parse_color(hex: &str) -> Result<egui::Color32, ()> {
-    let hex = hex.trim_start_matches('#');
-    if hex.len() == 6 {
-        let r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| ())?;
-        let g = u8::from_str_radix(&hex[2..4], 16).map_err(|_| ())?;
-        let b = u8::from_str_radix(&hex[4..6], 16).map_err(|_| ())?;
-        Ok(egui::Color32::from_rgb(r, g, b))
-    } else {
-        Err(())
-    }
-}
-
-fn main() -> Result<(), eframe::Error> {
-    env_logger::init();
-    let port = 8000 + (rand::random::<u16>() % 1000);
-    let (tx_net, rx_net) = std::sync::mpsc::channel::<NetEvent>();
-    let (tx_gui, rx_gui) = mpsc::channel::<GuiCommand>(32);
-
-    thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(run_network_layer(port, tx_net, rx_gui));
     });
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([500.0, 750.0]),
-        ..Default::default()
-    };
-
+    let title = format!("Project Zero (Port {})", config.port);
+    let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "Project Zero: Secure Node (With Intruder Mode)",
+        &title,
         options,
-        Box::new(move |cc| Ok(Box::new(ZeroApp::new(cc, rx_net, tx_gui, port)))),
-    )
+        Box::new(|cc| Ok(Box::new(GuiApp::new(cc, tx_cmd, rx_event, my_id)))),
+    ).map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+async fn smart_broadcast(payload: Payload, key: &SigningKey, transport: &Transport, peers: &Arc<Mutex<PeerManager>>, seen_packets: &mut HashSet<String>) {
+    let payload_bytes = bincode::serialize(&payload).unwrap();
+    if payload_bytes.len() <= CHUNK_SIZE {
+        let packet = ZeroPacket::new(payload, key);
+        seen_packets.insert(packet.id.clone());
+        broadcast_packet(&packet, transport, peers).await;
+    } else {
+        let total_chunks = (payload_bytes.len() as f32 / CHUNK_SIZE as f32).ceil() as u32;
+        let group_id = Uuid::new_v4().to_string();
+        for i in 0..total_chunks {
+            let start = (i as usize) * CHUNK_SIZE;
+            let end = std::cmp::min(start + CHUNK_SIZE, payload_bytes.len());
+            let chunk_data = payload_bytes[start..end].to_vec();
+            let chunk_payload = Payload::Chunk { group_id: group_id.clone(), index: i, total: total_chunks, data: chunk_data };
+            let packet = ZeroPacket::new(chunk_payload, key);
+            seen_packets.insert(packet.id.clone());
+            broadcast_packet(&packet, transport, peers).await;
+            tokio::task::yield_now().await; 
+        }
+    }
+}
+
+async fn broadcast_packet(packet: &ZeroPacket, transport: &Transport, peers: &Arc<Mutex<PeerManager>>) {
+    let all_peers = peers.lock().unwrap().get_all_addrs();
+    for addr in all_peers { let _ = transport.send_to(packet.clone(), addr).await; }
+}
+
+async fn process_inbound_payload(
+    payload: Payload,
+    key: &SigningKey,
+    transport: &Transport,
+    peers: &Arc<Mutex<PeerManager>>,
+    store: &Arc<ZeroStore>,
+    event_tx: &mpsc::Sender<GuiEvent>,
+    assembler: &mut Assembler,
+    seen_packets: &mut HashSet<String>,
+    sender_addr: SocketAddr,
+) {
+    match payload {
+        Payload::Chunk { group_id, index, total, data } => {
+            debug!("Received Chunk {}/{} for {}", index + 1, total, &group_id[0..8]);
+            if let Some(full_bytes) = assembler.add_chunk(group_id.clone(), index, total, data.clone()) {
+                if let Ok(original_payload) = bincode::deserialize::<Payload>(&full_bytes) {
+                    Box::pin(process_inbound_payload(original_payload, key, transport, peers, store, event_tx, assembler, seen_packets, sender_addr)).await;
+                }
+            }
+            let new_payload = Payload::Chunk { group_id, index, total, data };
+            let new_packet = ZeroPacket::new(new_payload, key);
+            if !seen_packets.contains(&new_packet.id) {
+                seen_packets.insert(new_packet.id.clone());
+                broadcast_packet(&new_packet, transport, peers).await;
+            }
+        }
+        Payload::Store { cid, data } => {
+            let _ = store.store(&data).await;
+            smart_broadcast(Payload::Store { cid, data }, key, transport, peers, seen_packets).await;
+        }
+        Payload::Fetch { cid } => {
+            if let Ok(data) = store.fetch(&cid).await {
+                let reply = Payload::Data { cid: cid.clone(), data };
+                smart_broadcast(reply, key, transport, peers, seen_packets).await;
+            } else {
+                smart_broadcast(Payload::Fetch { cid }, key, transport, peers, seen_packets).await;
+            }
+        }
+        Payload::Data { cid, data } => {
+            if let Ok(_) = store.store(&data).await {
+                let _ = event_tx.send(GuiEvent::ContentArrived { cid, data }).await;
+            }
+        }
+        _ => { smart_broadcast(payload, key, transport, peers, seen_packets).await; }
+    }
+}
+
+struct GuiApp {
+    tx: mpsc::Sender<Command>,
+    rx: mpsc::Receiver<GuiEvent>,
+    my_id: PeerId,
+    logs: Vec<String>,
+    editor_text: String,
+    search_cid: String,
+    
+    last_asset_cid: Option<String>,
+    last_page_cid: Option<String>,
+    status_message: Option<String>,
+    
+    current_cid: Option<String>,
+    view_root: Option<Component>,
+    view_raw_error: Option<String>,
+    texture_cache: HashMap<String, egui::TextureHandle>,
+    requested_resources: HashSet<String>,
+
+    app_state: HashMap<String, i32>,
+}
+
+impl GuiApp {
+    fn new(_cc: &eframe::CreationContext<'_>, tx: mpsc::Sender<Command>, rx: mpsc::Receiver<GuiEvent>, my_id: PeerId) -> Self {
+        Self {
+            tx, rx, my_id,
+            logs: vec![],
+            editor_text: r#"{
+  "type": "VStack",
+  "spacing": 20.0,
+  "children": [
+    { "type": "Text", "value": "Interactive ZeroApp", "size": 30.0 },
+    { "type": "HStack", "spacing": 20.0, "children": [
+        { "type": "Text", "value": "Counter:", "size": 20.0 },
+        { "type": "Text", "value": "$counter", "size": 20.0 }
+    ]},
+    { "type": "Button", "label": "Increment (+1)", "on_click": { "type": "Increment", "key": "counter" } },
+    
+    { "type": "HStack", "spacing": 20.0, "children": [
+         { "type": "Text", "value": "Light Switch:", "size": 20.0 },
+         { "type": "Text", "value": "$light", "size": 20.0 }
+    ]},
+    { "type": "Button", "label": "Toggle Switch", "on_click": { "type": "Toggle", "key": "light" } }
+  ]
+}"#.to_string(),
+            search_cid: String::new(),
+            last_asset_cid: None,
+            last_page_cid: None,
+            status_message: None,
+            current_cid: None,
+            view_root: None,
+            view_raw_error: None,
+            texture_cache: HashMap::new(),
+            requested_resources: HashSet::new(),
+            app_state: HashMap::new(),
+        }
+    }
+
+    fn load_texture(&self, ctx: &egui::Context, name: &str, data: &[u8]) -> Option<egui::TextureHandle> {
+        if let Ok(image) = image::load_from_memory(data) {
+            let size = [image.width() as _, image.height() as _];
+            let image_buffer = image.to_rgba8();
+            let pixels = image_buffer.as_flat_samples();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+            return Some(ctx.load_texture(name, color_image, Default::default()));
+        }
+        None
+    }
+}
+
+impl eframe::App for GuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(ev) = self.rx.try_recv() {
+            match ev {
+                GuiEvent::Log(s) => self.logs.push(s),
+                GuiEvent::Error(s) => self.logs.push(format!("❌ {}", s)),
+                GuiEvent::PublishSuccess { cid, is_json } => {
+                    if is_json {
+                        self.last_page_cid = Some(cid.clone());
+                        self.status_message = Some(format!("Page Published! {}", &cid[0..6]));
+                    } else {
+                        self.last_asset_cid = Some(cid.clone());
+                        self.status_message = Some(format!("Asset Uploaded! {}", &cid[0..6]));
+                    }
+                },
+                GuiEvent::ContentArrived { cid, data } => {
+                    if let Ok(json_str) = String::from_utf8(data.clone()) {
+                         if json_str.trim().starts_with('{') {
+                             if let Some(root) = zeroui::parse_blueprint(&json_str) {
+                                 self.view_root = Some(root);
+                                 self.current_cid = Some(cid.clone());
+                                 self.search_cid = cid.clone();
+                                 self.view_raw_error = None;
+                                 self.logs.push(format!("App Loaded: {}", &cid[0..8]));
+                                 self.app_state.clear();
+                                 continue; 
+                             }
+                         }
+                    }
+                    if let Some(texture) = self.load_texture(ctx, &cid, &data) {
+                        self.texture_cache.insert(cid.clone(), texture);
+                        self.logs.push(format!("Img Loaded: {}", &cid[0..8]));
+                    } else {
+                        if self.current_cid.as_ref() == Some(&cid) {
+                             self.view_raw_error = Some(format!("Unknown Data ({}b)", data.len()));
+                        }
+                    }
+                }
+            }
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| { ui.heading(format!("Node: {}", self.my_id.short())); });
+            if let Some(msg) = &self.status_message { ui.colored_label(egui::Color32::GREEN, msg); }
+
+            ui.columns(2, |cols| {
+                cols[0].group(|ui| {
+                    ui.heading("Creator Studio");
+                    ui.separator();
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("📂 Upload Image").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg"]).pick_file() {
+                                if let Ok(bytes) = std::fs::read(&path) {
+                                    self.logs.push(format!("Uploading {}kb...", bytes.len() / 1024));
+                                    let _ = self.tx.try_send(Command::Publish { content: bytes });
+                                }
+                            }
+                        }
+                        if let Some(cid) = &self.last_asset_cid {
+                            if ui.button("📋 Asset CID").clicked() { ui.output_mut(|o| o.copied_text = cid.clone()); }
+                        }
+                    });
+
+                    ui.separator();
+                    ui.add(egui::TextEdit::multiline(&mut self.editor_text).code_editor().desired_rows(15));
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("🚀 Publish App Blueprint").clicked() {
+                            let bytes = self.editor_text.as_bytes().to_vec();
+                            let _ = self.tx.try_send(Command::Publish { content: bytes });
+                        }
+                        if let Some(cid) = &self.last_page_cid {
+                            if ui.button("📋 Page CID").clicked() { ui.output_mut(|o| o.copied_text = cid.clone()); }
+                        }
+                    });
+                });
+
+                cols[1].group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("CID:");
+                        ui.text_edit_singleline(&mut self.search_cid);
+                        if ui.button("Fetch").clicked() {
+                            let _ = self.tx.try_send(Command::Fetch { cid: self.search_cid.clone() });
+                        }
+                    });
+                    ui.separator();
+                    
+                    egui::ScrollArea::vertical().id_salt("projector").show(ui, |ui| {
+                        if let Some(root) = &self.view_root {
+                            let render_ctx = RenderContext { textures: &self.texture_cache, state: &self.app_state };
+                            
+                            if let Some(action) = zeroui::render(ui, &render_ctx, root) {
+                                match action {
+                                    Action::Navigate(target) => { let _ = self.tx.try_send(Command::Fetch { cid: target }); }
+                                    Action::LoadResource(res_cid) => {
+                                        if !self.requested_resources.contains(&res_cid) {
+                                            self.requested_resources.insert(res_cid.clone());
+                                            let _ = self.tx.try_send(Command::Fetch { cid: res_cid });
+                                        }
+                                    }
+                                    Action::MutateState(mutation) => {
+                                        match mutation {
+                                            StateMutation::Increment { key } => {
+                                                let val = self.app_state.entry(key).or_insert(0);
+                                                *val += 1;
+                                            }
+                                            StateMutation::Toggle { key } => {
+                                                let val = self.app_state.entry(key).or_insert(0);
+                                                *val = if *val == 0 { 1 } else { 0 };
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(err) = &self.view_raw_error {
+                            ui.colored_label(egui::Color32::RED, err);
+                        } else {
+                            ui.label("Idle.");
+                        }
+                    });
+                });
+            });
+            
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
+                for log in self.logs.iter().rev() { 
+                    if log.starts_with("❌") { ui.colored_label(egui::Color32::RED, log); } else { ui.label(log); }
+                }
+            });
+        });
+        ctx.request_repaint();
+    }
 }
