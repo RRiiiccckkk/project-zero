@@ -1,47 +1,63 @@
 code
 Markdown
-# Project Zero (v0.5)
+# Project Zero (v0.9.99 "Super-Nova")
 
-> **The Client is a Projector.**  
+> **The Client is a Projector.**
 > Next-Gen P2P Infrastructure built on Rust.
 
 ## 🌌 Vision
-Project Zero 旨在重构互联网基础设施。我们抛弃了臃肿的 Web 栈 (HTML/JS/DOM)，采用 **"Remote Declarative UI" (远程声明式 UI)** 和 **"Pixel Streaming"** 理念。客户端不再计算逻辑，只负责像投影仪一样渲染接收到的蓝图。
+Project Zero 旨在重构互联网基础设施。我们抛弃了 Web 栈，采用 **"Remote Declarative UI"** 和 **"UDP Pixel Streaming"**。客户端不再计算逻辑，只负责像投影仪一样渲染接收到的蓝图。
 
-## 🏗 Architecture (v0.5 "Mobile Link")
-- **Core:** Rust + Tokio (Async Runtime)
-- **UI Engine:** Egui (Immediate Mode GUI)
-- **Transport:** UDP + Custom Fragmentation Protocol (Break MTU limits)
-- **Discovery:** UDP Broadcast Beacon (LAN Zero-Config)
+## 🏗 Architecture (v0.9.99)
+- **Core:** Rust (No-std logic, Sync/Thread-based)
+- **Transport:** UDP + Custom Fragmentation + **Multi-Socket Hydra** (Anti-VPN/Proxy)
+- **Discovery:** 
+    - **Omni-Radar:** 自动识别本机物理网段。
+    - **Smart Bomb:** 针对性单播扫描 (穿透 AP 隔离)。
+    - **Super-Nova:** 跨网段 (±50 Subnets) 深度扫描。
 - **Platform:** macOS / Linux / Windows / **Android (Native Activity)**
 
 ## 📱 Android Support
-v0.5 版本正式打通了 Android NDK 交叉编译链路。
-- **No Java/Kotlin:** 纯 Rust 实现，通过 `android-activity` 直接对接 Native 窗口。
-- **Thread Isolation:** 独立的后台逻辑线程，解决 UI 线程阻塞导致的 ANR/Crash 问题。
-- **P2P Enabled:** 手机端作为完整节点，支持局域网自动发现与互联。
+v0.9.99 彻底解决了 Android 权限与构建痛点：
+- **Permission Injection:** 通过 `Cargo.toml` TOML 注入绕过 Manifest 缓存。
+- **Structure:** 采用 `lib.rs` (Core) + `examples/` (Desktop) 分离架构。
+- **Resilience:** 在 VPN/5G 环境下仍能通过物理网卡锁定局域网目标。
 
 ## 🚀 Getting Started
 
 ### Prerequisites
 1. Install Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-2. Install Android Tools (for mobile build):
-   - Android Studio & NDK (API 33+)
-   - `cargo install cargo-apk`
-   - `rustup target add aarch64-linux-android`
+2. Install Android Tools (NDK API 33+) & `cargo-apk`.
 
 ### Running on Desktop
 ```bash
-cargo run
-Running on Android
-See USER_MANUAL.md for detailed cross-compilation guide.
+# 启动 PC 端控制台
+cargo run --example desktop
 
+Running on Android
+code
+Bash
+# 1. 清理 (重要)
+rm -rf target
+
+# 2. 编译库并安装 (必须加 --lib 以避免冲突)
+cargo apk build --lib
+adb install -r target/debug/apk/project_zero.apk
+
+🎮 How to Use
+Launch: 启动手机端和电脑端。
+Scan:
+电脑端点击 "SCAN LOCAL NETWORK" (自动) 或 "SUPER SCAN" (跨网段)。
+Connect:
+在 "DETECTED NODES" 列表中点击发现的目标。
+Fire:
+点击 "SEND FILE"。
 🗺 Roadmap
 
-Phase 1-20: Core Protocol, Fragmentation, ZeroStore.
+Phase 22: Visual Link (UDP Image Transport)
 
-Phase 21: Android Cross-compilation & LAN Discovery. (Current)
+Phase 23: Omni-Radar Discovery (Anti-AP-Isolation)
 
-Phase 22: Visual Content Transmission (Camera/Blueprints).
+Phase 24: Remote UI Control (JSON Blueprints)
 
-Phase 23: Global DHT Identity.
+Phase 25: Global DHT Identity

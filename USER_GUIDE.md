@@ -258,4 +258,59 @@ App 闪退 (Crash on Launch):
 检查电脑防火墙是否允许了 UDP 传入连接。
 路由器可能开启了 AP 隔离，尝试使用 "Manual Connect" 输入 IP 直连。
 
+
+# Project Zero v0.9.99 User Manual
+
+**Version:** 0.9.99 Beta (The "Super-Nova" Release)
+**Architecture:** Hydra UDP + Omni-Radar + ZeroUI
+
+---
+
+## 1. 快速连接指南 (Quick Start)
+
+### 步骤 A: 启动节点
+1.  **手机端 (Receiver):** 
+    *   打开 Project Zero APP。
+    *   顶部应显示绿色 **✅ HOST (44444)**。
+    *   *注意：如果显示 ⚠️ CLIENT，请检查权限或重启 APP。*
+2.  **电脑端 (Sender):**
+    *   运行 `cargo run --example desktop`。
+
+### 步骤 B: 自动发现 (Discovery)
+Project Zero 内置了穿透防火墙的雷达系统。
+
+1.  **标准扫描 (推荐):**
+    *   点击电脑端的 **"📡 SCAN LOCAL NETWORK"**。
+    *   系统会自动识别本机物理 IP，并轰炸当前网段。
+2.  **超级扫描 (跨网段):**
+    *   如果手机和电脑不在同一个网段（例如电脑在 10.7.131.x，手机在 10.7.169.x）。
+    *   手动修改 **Prefix** 为 `10.7.131` (或其他中心点)。
+    *   点击 **"💥 SUPER SCAN (±50 Subnets)"**。
+    *   *注意：此过程耗时较长，请耐心等待。*
+
+### 步骤 C: 锁定与发送
+1.  当雷达扫到目标时，**"DETECTED TARGETS"** 列表会弹出。
+2.  点击 **"🔗 CONNECT"** 锁定目标。
+3.  确认 **File** 路径正确，点击 **"🚀 SEND"**。
+4.  手机端将实时显示接收到的画面。
+
+---
+
+## 2. 故障排除 (Troubleshooting)
+
+### Q: 为什么扫描不到手机？
+*   **检查 VPN:** 确保电脑已关闭 Clash/Surge 等代理软件，或使用 "Super Scan" 模式（Hydra 架构会自动尝试绕过 VPN）。
+*   **检查 IP:** 看手机屏幕顶部的 "MY IDENTITY"。如果 IP 是 `10.x` 或 `192.x`，确保电脑扫描的前缀与之匹配。
+*   **AP 隔离:** 如果处于严格的企业/校园网，请尝试用电脑开启 **个人热点**，让手机连接热点。
+
+### Q: 为什么显示 "File error"?
+*   检查电脑端输入的文件路径是否绝对正确。建议直接将文件拖入终端获取路径。
+
+### Q: 手机端显示乱码或不显示？
+*   目前的 v0.9 版本仅支持传输 `.jpg` 或 `.png` 图片。传输文本或其他文件可能会导致渲染失败。
+
+---
+
+> **Project Zero** - *Trust Code, Not Middleboxes.*
+
 ```
