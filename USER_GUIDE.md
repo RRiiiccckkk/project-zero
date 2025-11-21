@@ -172,4 +172,90 @@ Project Zero 突破了 UDP 的 MTU 限制（通常 <1500 字节）。
 ---
 
 > **Project Zero** - *Trust Math, Not Servers.*
+
+```markdown
+# Project Zero: Developer Manual
+
+本手册指导如何在 macOS 上配置开发环境，并将 Project Zero 部署到 Android 设备。
+
+## 🛠️ Environment Setup (Android)
+
+这是最困难的一步。请确保环境变量配置正确。
+
+### 1. 安装依赖
+确保安装了 Android Studio，并在 SDK Manager 中下载：
+- Android SDK Platform 33 (及 34)
+- NDK (Side by side) - 推荐版本 25.x 或 26.x
+- Android SDK Command-line Tools
+
+### 2. 配置环境变量 (Zsh)
+编辑 `~/.zshrc`，添加以下内容 (路径根据实际情况修改)：
+
+```zsh
+# Android SDK Root
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+
+# NDK Path (这是关键，cargo-apk 需要它)
+# 提示：去目录里检查具体版本号
+export NDK_HOME="$ANDROID_HOME/ndk/26.1.10909125" 
+
+# Java (推荐使用 Android Studio 内置 JDK 17+)
+export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+
+# Path 更新
+export PATH="$JAVA_HOME/bin:$PATH"
+export PATH="$PATH:$ANDROID_HOME/platform-tools"
+export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin"
+执行 source ~/.zshrc 生效。
+
+3. 安装 Rust 工具链
+code
+Zsh
+rustup target add aarch64-linux-android
+cargo install cargo-apk
+📲 Build & Deploy (The "Air-Bridge" Method)
+由于直接 USB 调试可能不稳定，我们推荐使用 "HTTP 传送门" 方案进行部署。
+
+Step 1: 编译 APK
+在项目根目录执行：
+
+code
+Zsh
+# 首次编译建议先清理
+cargo clean 
+
+# 构建 Debug 包
+cargo apk build
+成功标志：终端显示绿色的 Finished。
+
+Step 2: 启动传送服务
+进入构建产物目录并启动 Python 服务器：
+
+code
+Zsh
+cd target/debug/apk
+python3 -m http.server 8000
+Step 3: 手机安装
+确保手机和电脑在 同一 Wi-Fi 下。
+查看电脑 IP：ipconfig getifaddr en0 (例如 192.168.1.5)。
+手机浏览器访问：http://192.168.1.5:8000。
+下载 project-zero.apk 并安装。
+🔍 Debugging (日志调试)
+如果 APP 闪退或无法连接，使用 adb logcat 抓取日志。
+
+开启手机 "开发者模式" -> "USB 调试"。
+连接电脑，确保 adb devices 显示设备。
+执行过滤监听命令 (这是查看 Rust 报错的唯一方式)：
+code
+Zsh
+adb logcat -c && adb logcat -v color '*:S' Rust:D AndroidRuntime:E System.err:E
+⚠️ Common Issues
+App 闪退 (Crash on Launch):
+通常是因为 android_main 入口丢失或 NativeOptions 未正确传递 android_app 句柄。
+检查 main.rs 中的 options.event_loop_builder 配置。
+无法连接 (Network Error):
+确保手机没有开 VPN/5G，必须在局域网内。
+检查电脑防火墙是否允许了 UDP 传入连接。
+路由器可能开启了 AP 隔离，尝试使用 "Manual Connect" 输入 IP 直连。
+
 ```

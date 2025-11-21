@@ -1,25 +1,65 @@
 [package]
 name = "project-zero"
-version = "0.3.1"
+version = "0.5.0"
 edition = "2021"
 
+[lib]
+name = "project_zero"
+crate-type = ["cdylib"]
+path = "src/main.rs"
+
+# --- 关键修复：允许 Panic 展开，防止直接 Abort ---
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+# ---------------------------------------------
+
 [dependencies]
-tokio = { version = "1.32", features = ["full"] }
+# UI & Runtime (Latest Stable)
+eframe = { version = "0.29.1", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+egui = "0.29.1"
+tokio = { version = "1.40", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
+
+# Data & Crypto
+bincode = "1.3"
+crc32fast = "1.3"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
+uuid = { version = "1.10", features = ["v4"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"
-ed25519-dalek = { version = "2.0", features = ["rand_core"] }
 sha2 = "0.10"
-eframe = "0.29.1" 
-egui = "0.29.1"
-uuid = { version = "1.0", features = ["v4", "serde"] }
-bincode = "1.3"
 chrono = "0.4"
-image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
 
-# 新增：跨平台文件选择器
-rfd = "0.12"
+# Android Specific (Matched to eframe 0.29 / winit 0.30)
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+android-activity = { version = "0.6", features = ["native-activity"] }
+winit = { version = "0.30", features = ["android-native-activity"] }
+
+# Build Config
+[package.metadata.android]
+package = "com.projectzero.node"
+label = "ZeroNode"
+icon = "@mipmap/ic_launcher"
+fullscreen = true
+target_sdk_version = 34 # 升级到 Android 14 SDK
+min_sdk_version = 26
+assets = "assets"
+build_targets = ["aarch64-linux-android"]
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"
